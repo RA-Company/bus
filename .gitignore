@@ -1,0 +1,12 @@
+.idea
+.air.toml
+.env
+.test.env
+tmp
+
+# Visual Studio Code
+.vscode/*
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.history/*
