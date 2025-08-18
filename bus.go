@@ -21,11 +21,13 @@ var (
 )
 
 type Bus struct {
+	logging.CustomLogger
 	redis        *redis.RedisClient
 	stream       string                       // Stream name for the bus
 	group        string                       // Consumer group name
 	workersCount int                          // Number of workers to process tasks
 	numRetries   int                          // Number of retries for failed tasks
+	streamSize   int                          // Maximum size of the stream
 	receivers    map[string]ReceiverInterface // Map of receivers by name
 }
 
@@ -35,12 +37,25 @@ type BusConfiguration struct {
 	Group        string             // Consumer group name
 	WorkersCount int                // Number of workers to process tasks
 	NumRetries   int                // Number of retries for failed tasks
+	StreamSize   int                // Maximum size of the stream
 }
 
 type RedisConfiguration struct {
-	Hosts    string // Comma-separated list of Redis hosts
-	DB       int    // Redis database number
-	Password string // Redis password
+	Hosts           string // Comma-separated list of Redis hosts
+	DB              int    // Redis database number
+	Password        string // Redis password
+	DoNotLogQueries bool   // Whether to log Redis queries
+}
+
+// SetLogger allows setting a custom logger for the bus.
+// This is useful when you want to use a different logging mechanism
+// instead of the default one provided by the package.
+//
+// Parameters:
+//   - logger: An instance of a type that implements the logging.Logger interface.
+func (dst *Bus) SetLogger(logger logging.Logger) {
+	dst.CustomLogger.SetLogger(logger)
+	dst.redis.SetLogger(logger)
 }
 
 // Init initializes the bus with the provided configuration.
@@ -52,12 +67,9 @@ type RedisConfiguration struct {
 //   - ctx: The context for the operation.
 //   - config: The configuration for the bus, including Redis connection details, stream name, group name, workers count, and number of retries.
 func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
-	logger := logging.Logging{
-		LogLevel: 2,
+	dst.redis = &redis.RedisClient{
+		DoNotLogQueries: config.Redis.DoNotLogQueries,
 	}
-
-	dst.redis = &redis.RedisClient{}
-	dst.redis.SetLogger(&logger)
 	dst.redis.Start(ctx, config.Redis.Hosts, config.Redis.Password, config.Redis.DB)
 
 	dst.stream = config.Stream
@@ -75,17 +87,23 @@ func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
 		dst.workersCount = 10 // Default to 10 worker if not provided or invalid
 	}
 	if dst.workersCount > 100 {
-		logging.Logs.Warnf(ctx, "Workers count is too high (%d), setting to 100", dst.workersCount)
+		dst.Warn(ctx, "Workers count is too high (%d), setting to 100", dst.workersCount)
 		dst.workersCount = 100 // Cap the workers count to 100
 	}
+
 	dst.numRetries = config.NumRetries
 	if dst.numRetries <= 0 {
 		dst.numRetries = 5 // Default to 5 retries if not provided or invalid
 	}
 
+	dst.streamSize = config.StreamSize
+	if dst.streamSize <= 0 {
+		dst.streamSize = 10000 // Default to 10000 messages in the stream if not provided or invalid
+	}
+
 	err := dst.redis.XGroupCreateMkStream(ctx, dst.stream, dst.group, "$")
 	if err != nil && err != redis.ErrorGroupAlreadyExists {
-		logging.Logs.Fatalf(ctx, "Failed to create group %s for stream %s: %v", dst.group, dst.stream, err)
+		dst.Fatal(ctx, "Failed to create group %s for stream %s: %v", dst.group, dst.stream, err)
 		os.Exit(1)
 	}
 }
@@ -102,7 +120,7 @@ func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
 //   - receiver: The ReceiverInterface implementation that defines the receiver's behavior.
 func (dst *Bus) RegisterReceiver(ctx context.Context, title string, receiver ReceiverInterface) {
 	if title == "" {
-		logging.Logs.Errorf(ctx, "Receiver title cannot be empty")
+		dst.Error(ctx, "Receiver title cannot be empty")
 		return
 	}
 
@@ -111,11 +129,11 @@ func (dst *Bus) RegisterReceiver(ctx context.Context, title string, receiver Rec
 	}
 
 	if _, exists := dst.receivers[title]; exists {
-		logging.Logs.Warnf(ctx, "Receiver %q is already registered, overwriting it", title)
+		dst.Warn(ctx, "Receiver %q is already registered, overwriting it", title)
 	}
 
 	dst.receivers[title] = receiver
-	logging.Logs.Infof(ctx, "Receiver %q registered successfully", title)
+	dst.Info(ctx, "Receiver %q registered successfully", title)
 }
 
 // Start starts the bus by launching the specified number of worker goroutines.
@@ -141,10 +159,10 @@ func (dst *Bus) Start(ctx context.Context) {
 	}
 
 	<-ctx.Done()
-	logging.Logs.Infof(ctx, "Bus stopped, waiting for workers to finish")
+	dst.Info(ctx, "Bus stopped, waiting for workers to finish")
 
 	wg.Wait()
-	logging.Logs.Infof(ctx, "All workers finished, bus stopped")
+	dst.Info(ctx, "All workers finished, bus stopped")
 }
 
 // AddMessage adds a new message to the bus stream.
@@ -181,13 +199,14 @@ func (dst *Bus) AddMessage(ctx context.Context, receiver string, payload any) (s
 	_, err = dst.redis.XAdd(ctx, &re.XAddArgs{
 		Stream: dst.stream,
 		Values: message,
+		MaxLen: int64(dst.streamSize), // Limit the stream size
 	})
 	if err != nil {
-		logging.Logs.Errorf(ctx, "dst.redis.XAdd() error: %v", err)
+		dst.Error(ctx, "dst.redis.XAdd() error: %v", err)
 		return "", err
 	}
 
-	logging.Logs.Infof(ctx, "Message %q added to stream %q with ID %q", receiver, dst.stream, id)
+	dst.Info(ctx, "Message %q added to stream %q with ID %q", receiver, dst.stream, id)
 
 	return id, nil
 }
@@ -216,7 +235,7 @@ func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error 
 	}
 
 	if _, err := dst.redis.XAdd(ctx, &re.XAddArgs{Stream: dst.stream, Values: message}); err != nil {
-		logging.Logs.Errorf(ctx, "dst.redis.XAdd() error: %v", err)
+		dst.Error(ctx, "dst.redis.XAdd() error: %v", err)
 		return err
 	}
 
@@ -235,11 +254,11 @@ func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error 
 func worker(ctx context.Context, bus *Bus) {
 	worker := uuid.New().String()
 	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
-	logging.Logs.Infof(ctx, "Worker %q was started", worker)
+	bus.Info(ctx, "Worker %q was started", worker)
 	for {
 		select {
 		case <-ctx.Done():
-			logging.Logs.Infof(ctx, "Worker %q was stopped", worker)
+			bus.Info(ctx, "Worker %q was stopped", worker)
 			return
 		default:
 			claims, err := bus.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
@@ -252,7 +271,7 @@ func worker(ctx context.Context, bus *Bus) {
 			})
 
 			if err != nil {
-				logging.Logs.Errorf(ctx, "Failed to auto claim message: %v", err)
+				bus.Error(ctx, "Failed to auto claim message: %v", err)
 				time.Sleep(5 * time.Second) // Wait before retrying
 				continue
 			}
@@ -261,7 +280,7 @@ func worker(ctx context.Context, bus *Bus) {
 				if _, ok := bus.receivers[claims[0].Values["receiver"].(string)]; ok {
 					err = processMessage(ctx, bus, claims[0])
 					if err != nil {
-						logging.Logs.Errorf(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
+						bus.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
 					}
 				}
 				continue
@@ -275,7 +294,7 @@ func worker(ctx context.Context, bus *Bus) {
 				Count:    1,
 			})
 			if err != nil {
-				logging.Logs.Errorf(ctx, "Failed to read from stream %s: %v", bus.stream, err)
+				bus.Error(ctx, "Failed to read from stream %s: %v", bus.stream, err)
 				continue
 			}
 
@@ -289,7 +308,7 @@ func worker(ctx context.Context, bus *Bus) {
 
 			err = processMessage(ctx, bus, messages[0].Messages[0])
 			if err != nil {
-				logging.Logs.Errorf(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
+				bus.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
 			}
 		}
 	}
@@ -312,22 +331,22 @@ func processMessage(ctx context.Context, bus *Bus, msg re.XMessage) error {
 	if _, ok := bus.receivers[msg.Values["receiver"].(string)]; ok {
 		err := bus.receivers[msg.Values["receiver"].(string)].Start(ctx, msg.Values)
 		if err != nil {
-			logging.Logs.Errorf(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
+			bus.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
 			// Retry the receiver
 			err = bus.RetryMessage(ctx, msg.Values)
 			if err != nil {
-				logging.Logs.Errorf(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+				bus.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
 			}
 			return err
 		}
 
 		err = bus.receivers[msg.Values["receiver"].(string)].Execute()
 		if err != nil {
-			logging.Logs.Errorf(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
+			bus.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
 			// Retry the receiver
 			err = bus.RetryMessage(ctx, msg.Values)
 			if err != nil {
-				logging.Logs.Errorf(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+				bus.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
 			}
 			return err
 		}

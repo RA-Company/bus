@@ -1,13 +1,13 @@
 module github.com/ra-company/bus
 
-go 1.24.5
+go 1.25.0
 
 require (
 	github.com/brianvoe/gofakeit/v7 v7.3.0
 	github.com/google/uuid v1.6.0
-	github.com/ra-company/database v1.0.8
+	github.com/ra-company/database v1.0.10
 	github.com/ra-company/env v1.0.1
-	github.com/ra-company/logging v1.0.6
+	github.com/ra-company/logging v1.0.7
 	github.com/redis/go-redis/v9 v9.12.1
 	github.com/stretchr/testify v1.10.0
 )

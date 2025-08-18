@@ -53,9 +53,10 @@ func Test(t *testing.T) {
 
 	bus.Init(ctx, &BusConfiguration{
 		Redis: RedisConfiguration{
-			Hosts:    redisHosts,
-			Password: redisPassword,
-			DB:       redisDB,
+			Hosts:           redisHosts,
+			Password:        redisPassword,
+			DB:              redisDB,
+			DoNotLogQueries: false, // Enable query logging for tests
 		},
 		Stream:       stream,
 		Group:        group,
