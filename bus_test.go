@@ -102,13 +102,11 @@ func Test(t *testing.T) {
 
 	defer redis.Redis.XGroupDestroy(ctx, bus.stream, bus.group)
 
-	testTask := &TestReceiver{}
-
-	bus.RegisterReceiver(ctx, "receiver", testTask)
+	bus.RegisterReceiver(ctx, "receiver", func() ReceiverInterface { return &TestReceiver{} })
 	require.NotNil(t, bus.receivers["receiver"], "Receiver should be registered")
-	bus.RegisterReceiver(ctx, "error_receiver", &TestErrorReceiver{})
+	bus.RegisterReceiver(ctx, "error_receiver", func() ReceiverInterface { return &TestErrorReceiver{} })
 	require.NotNil(t, bus.receivers["error_receiver"], "Error Receiver should be registered")
-	bus.RegisterReceiver(ctx, "panic_receiver", &TestPanicReceiver{})
+	bus.RegisterReceiver(ctx, "panic_receiver", func() ReceiverInterface { return &TestPanicReceiver{} })
 	require.NotNil(t, bus.receivers["panic_receiver"], "Panic Receiver should be registered")
 
 	timerCtx, cancel := context.WithTimeout(ctx, time.Second*2)

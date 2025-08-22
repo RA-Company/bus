@@ -20,18 +20,19 @@ import (
 )
 
 var (
-	ErrorEmptyReceiverTitle = fmt.Errorf("receiver title cannot be empty")
+	ErrorEmptyReceiverTitle    = fmt.Errorf("receiver title cannot be empty")
+	ErrorReceiverNotRegistered = fmt.Errorf("receiver not registered")
 )
 
 type Bus struct {
 	logging.CustomLogger
 	redis        *redis.RedisClient
-	stream       string                       // Stream name for the bus
-	group        string                       // Consumer group name
-	workersCount int                          // Number of workers to process tasks
-	numRetries   int                          // Number of retries for failed tasks
-	streamSize   int                          // Maximum size of the stream
-	receivers    map[string]ReceiverInterface // Map of receivers by name
+	stream       string                     // Stream name for the bus
+	group        string                     // Consumer group name
+	workersCount int                        // Number of workers to process tasks
+	numRetries   int                        // Number of retries for failed tasks
+	streamSize   int                        // Maximum size of the stream
+	receivers    map[string]ReceiverFactory // Map of receivers by name
 }
 
 type BusConfiguration struct {
@@ -70,6 +71,7 @@ func (dst *Bus) SetLogger(logger logging.Logger) {
 //   - ctx: The context for the operation.
 //   - config: The configuration for the bus, including Redis connection details, stream name, group name, workers count, and number of retries.
 func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
+	dst.receivers = make(map[string]ReceiverFactory)
 	dst.redis = &redis.RedisClient{
 		DoNotLogQueries: config.Redis.DoNotLogQueries,
 	}
@@ -121,14 +123,14 @@ func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
 //   - ctx: The context for the operation, used for cancellation and timeout.
 //   - title: The title of the receiver to register.
 //   - receiver: The ReceiverInterface implementation that defines the receiver's behavior.
-func (dst *Bus) RegisterReceiver(ctx context.Context, title string, receiver ReceiverInterface) {
+func (dst *Bus) RegisterReceiver(ctx context.Context, title string, receiver ReceiverFactory) {
 	if title == "" {
 		dst.Error(ctx, "Receiver title cannot be empty")
 		return
 	}
 
 	if dst.receivers == nil {
-		dst.receivers = make(map[string]ReceiverInterface)
+		dst.receivers = make(map[string]ReceiverFactory)
 	}
 
 	if _, exists := dst.receivers[title]; exists {
@@ -358,31 +360,37 @@ func (dst *Bus) workerJob(ctx context.Context, worker string) {
 // Returns:
 //   - error: An error if the receiver fails to start or execute, otherwise nil.
 func (dst *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
-	if _, ok := dst.receivers[msg.Values["receiver"].(string)]; ok {
-		err := dst.receivers[msg.Values["receiver"].(string)].Start(ctx, msg.Values)
-		if err != nil {
-			dst.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
-			// Retry the receiver
-			err = dst.retryMessage(ctx, msg.Values)
-			if err != nil {
-				dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
-			}
-			return err
-		}
-
-		err = dst.receivers[msg.Values["receiver"].(string)].Execute()
-		if err != nil {
-			dst.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
-			// Retry the receiver
-			err = dst.retryMessage(ctx, msg.Values)
-			if err != nil {
-				dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
-			}
-			return err
-		}
-
-		dst.receivers[msg.Values["receiver"].(string)].Finish()
+	factory, ok := dst.receivers[msg.Values["receiver"].(string)]
+	if !ok {
+		dst.redis.XAck(ctx, dst.stream, dst.group, msg.ID)
+		return ErrorReceiverNotRegistered
 	}
+
+	receiver := factory()
+	err := receiver.Start(ctx, msg.Values)
+	if err != nil {
+		dst.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
+		// Retry the receiver
+		err = dst.retryMessage(ctx, msg.Values)
+		if err != nil {
+			dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+		}
+		return err
+	}
+
+	err = receiver.Execute()
+	if err != nil {
+		dst.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
+		// Retry the receiver
+		err = dst.retryMessage(ctx, msg.Values)
+		if err != nil {
+			dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+		}
+		return err
+	}
+
+	receiver.Finish()
+
 	dst.redis.XAck(ctx, dst.stream, dst.group, msg.ID)
 
 	return nil

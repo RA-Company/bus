@@ -14,6 +14,8 @@ type ReceiverInterface interface {
 	Execute() error
 }
 
+type ReceiverFactory func() ReceiverInterface
+
 type Receiver struct {
 	start   time.Time
 	task    string
