@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"sync"
 	"syscall"
 	"time"
@@ -151,11 +152,9 @@ func (dst *Bus) Start(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for i := 0; i < dst.workersCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			worker(ctx, dst)
-		}()
+		wg.Go(func() {
+			safeWorker(ctx, dst, &wg)
+		})
 	}
 
 	<-ctx.Done()
@@ -242,6 +241,30 @@ func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error 
 	return nil
 }
 
+func safeWorker(ctx context.Context, bus *Bus, wg *sync.WaitGroup) {
+	worker := uuid.New().String()
+	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
+	bus.Info(ctx, "Worker %q was started", worker)
+
+	for {
+		select {
+		case <-ctx.Done():
+			bus.Info(ctx, "Worker %q was stopped", worker)
+			return
+		default:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						bus.Error("[worker %q] panic recovered: %v\n%s", worker, r, debug.Stack())
+					}
+				}()
+
+				workerJob(ctx, worker, bus)
+			}()
+		}
+	}
+}
+
 // worker is a goroutine that continuously processes messages from the Redis stream.
 // It auto-claims messages that have been idle for a specified minimum time and executes them.
 // If a message fails to execute, it retries the message based on the configured retry logic.
@@ -251,66 +274,57 @@ func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error 
 // Parameters:
 //   - ctx: The context for the worker, used for cancellation and timeout.
 //   - bus: The Bus instance that contains the Redis client and task definitions.
-func worker(ctx context.Context, bus *Bus) {
-	worker := uuid.New().String()
-	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
-	bus.Info(ctx, "Worker %q was started", worker)
-	for {
-		select {
-		case <-ctx.Done():
-			bus.Info(ctx, "Worker %q was stopped", worker)
-			return
-		default:
-			claims, err := bus.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
-				Stream:   bus.stream,
-				Group:    bus.group,
-				Consumer: worker,
-				MinIdle:  5 * time.Minute, // Minimum idle time for auto claim
-				Count:    1,
-				Start:    "0-0",
-			})
+func workerJob(ctx context.Context, worker string, bus *Bus) {
 
+	// Local panic recovery
+	claims, err := bus.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
+		Stream:   bus.stream,
+		Group:    bus.group,
+		Consumer: worker,
+		MinIdle:  5 * time.Minute, // Minimum idle time for auto claim
+		Count:    1,
+		Start:    "0-0",
+	})
+
+	if err != nil {
+		bus.Error(ctx, "Failed to auto claim message: %v", err)
+		time.Sleep(5 * time.Second) // Wait before retrying
+		return
+	}
+
+	if len(claims) == 1 {
+		if _, ok := bus.receivers[claims[0].Values["receiver"].(string)]; ok {
+			err = processMessage(ctx, bus, claims[0])
 			if err != nil {
-				bus.Error(ctx, "Failed to auto claim message: %v", err)
-				time.Sleep(5 * time.Second) // Wait before retrying
-				continue
-			}
-
-			if len(claims) == 1 {
-				if _, ok := bus.receivers[claims[0].Values["receiver"].(string)]; ok {
-					err = processMessage(ctx, bus, claims[0])
-					if err != nil {
-						bus.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
-					}
-				}
-				continue
-			}
-
-			messages, err := bus.redis.XReadGroup(ctx, &re.XReadGroupArgs{
-				Group:    bus.group,
-				Consumer: worker,
-				Streams:  []string{bus.stream, ">"},
-				Block:    1 * time.Second, // Block indefinitely until a new message arrives
-				Count:    1,
-			})
-			if err != nil {
-				bus.Error(ctx, "Failed to read from stream %s: %v", bus.stream, err)
-				continue
-			}
-
-			if len(messages) == 0 {
-				continue // No messages to process
-			}
-
-			if len(messages[0].Messages) == 0 {
-				continue
-			}
-
-			err = processMessage(ctx, bus, messages[0].Messages[0])
-			if err != nil {
-				bus.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
+				bus.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
 			}
 		}
+		return
+	}
+
+	messages, err := bus.redis.XReadGroup(ctx, &re.XReadGroupArgs{
+		Group:    bus.group,
+		Consumer: worker,
+		Streams:  []string{bus.stream, ">"},
+		Block:    1 * time.Second, // Block indefinitely until a new message arrives
+		Count:    1,
+	})
+	if err != nil {
+		bus.Error(ctx, "Failed to read from stream %s: %v", bus.stream, err)
+		return
+	}
+
+	if len(messages) == 0 {
+		return // No messages to process
+	}
+
+	if len(messages[0].Messages) == 0 {
+		return
+	}
+
+	err = processMessage(ctx, bus, messages[0].Messages[0])
+	if err != nil {
+		bus.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
 	}
 }
 
