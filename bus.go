@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -153,7 +155,7 @@ func (dst *Bus) Start(ctx context.Context) {
 
 	for i := 0; i < dst.workersCount; i++ {
 		wg.Go(func() {
-			safeWorker(ctx, dst, &wg)
+			dst.safeWorker(ctx)
 		})
 	}
 
@@ -210,7 +212,7 @@ func (dst *Bus) AddMessage(ctx context.Context, receiver string, payload any) (s
 	return id, nil
 }
 
-// RetryMessage retries a message by adding it back to the stream with an incremented retry count.
+// retryMessage retries a message by adding it back to the stream with an incremented retry count.
 // If the retry count exceeds the configured limit, it does not add the message back to the stream.
 // This method is useful for handling failed messages and implementing retry logic.
 //
@@ -220,16 +222,22 @@ func (dst *Bus) AddMessage(ctx context.Context, receiver string, payload any) (s
 //
 // Returns:
 //   - error: An error if the retry operation fails, otherwise nil.
-func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error {
+func (dst *Bus) retryMessage(ctx context.Context, message map[string]any) error {
 	if message == nil {
 		return fmt.Errorf("message cannot be nil")
 	}
 
-	if _, ok := message["retry"]; !ok {
-		message["retry"] = 0 // Initialize retry count if not present
+	var err error
+	retry := 0
+	if _, ok := message["retry"]; ok {
+		retry, err = strconv.Atoi(message["retry"].(string))
+		if err != nil {
+			retry = 0
+		}
 	}
-	message["retry"] = message["retry"].(int) + 1 // Increment retry count
-	if message["retry"].(int) > dst.numRetries {
+
+	message["retry"] = retry + 1 // Increment retry count
+	if retry > dst.numRetries {
 		return nil
 	}
 
@@ -241,31 +249,39 @@ func (dst *Bus) RetryMessage(ctx context.Context, message map[string]any) error 
 	return nil
 }
 
-func safeWorker(ctx context.Context, bus *Bus, wg *sync.WaitGroup) {
+// safeWorker is a wrapper around the worker function that recovers from panics.
+// It ensures that if a panic occurs within the worker, it is caught and logged,
+// allowing the worker to continue processing other messages.
+// This method is useful for improving the robustness of the worker by preventing crashes
+// due to unexpected errors.
+//
+// Parameters:
+//   - ctx: The context for the worker, used for cancellation and timeout.
+func (dst *Bus) safeWorker(ctx context.Context) {
 	worker := uuid.New().String()
 	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
-	bus.Info(ctx, "Worker %q was started", worker)
+	dst.Info(ctx, "Worker %q was started", worker)
 
 	for {
 		select {
 		case <-ctx.Done():
-			bus.Info(ctx, "Worker %q was stopped", worker)
+			dst.Info(ctx, "Worker %q was stopped", worker)
 			return
 		default:
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						bus.Error("[worker %q] panic recovered: %v\n%s", worker, r, debug.Stack())
+						dst.Error("[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
 					}
 				}()
 
-				workerJob(ctx, worker, bus)
+				dst.workerJob(ctx, worker)
 			}()
 		}
 	}
 }
 
-// worker is a goroutine that continuously processes messages from the Redis stream.
+// workerJob is a goroutine that continuously processes messages from the Redis stream.
 // It auto-claims messages that have been idle for a specified minimum time and executes them.
 // If a message fails to execute, it retries the message based on the configured retry logic.
 // The worker will log its status and any errors encountered during processing.
@@ -274,12 +290,12 @@ func safeWorker(ctx context.Context, bus *Bus, wg *sync.WaitGroup) {
 // Parameters:
 //   - ctx: The context for the worker, used for cancellation and timeout.
 //   - bus: The Bus instance that contains the Redis client and task definitions.
-func workerJob(ctx context.Context, worker string, bus *Bus) {
+func (dst *Bus) workerJob(ctx context.Context, worker string) {
 
 	// Local panic recovery
-	claims, err := bus.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
-		Stream:   bus.stream,
-		Group:    bus.group,
+	claims, err := dst.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
+		Stream:   dst.stream,
+		Group:    dst.group,
 		Consumer: worker,
 		MinIdle:  5 * time.Minute, // Minimum idle time for auto claim
 		Count:    1,
@@ -287,30 +303,30 @@ func workerJob(ctx context.Context, worker string, bus *Bus) {
 	})
 
 	if err != nil {
-		bus.Error(ctx, "Failed to auto claim message: %v", err)
+		dst.Error(ctx, "Failed to auto claim message: %v", err)
 		time.Sleep(5 * time.Second) // Wait before retrying
 		return
 	}
 
 	if len(claims) == 1 {
-		if _, ok := bus.receivers[claims[0].Values["receiver"].(string)]; ok {
-			err = processMessage(ctx, bus, claims[0])
+		if _, ok := dst.receivers[claims[0].Values["receiver"].(string)]; ok {
+			err = dst.processMessage(ctx, claims[0])
 			if err != nil {
-				bus.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
+				dst.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
 			}
 		}
 		return
 	}
 
-	messages, err := bus.redis.XReadGroup(ctx, &re.XReadGroupArgs{
-		Group:    bus.group,
+	messages, err := dst.redis.XReadGroup(ctx, &re.XReadGroupArgs{
+		Group:    dst.group,
 		Consumer: worker,
-		Streams:  []string{bus.stream, ">"},
+		Streams:  []string{dst.stream, ">"},
 		Block:    1 * time.Second, // Block indefinitely until a new message arrives
 		Count:    1,
 	})
 	if err != nil {
-		bus.Error(ctx, "Failed to read from stream %s: %v", bus.stream, err)
+		dst.Error(ctx, "Failed to read from stream %s: %v", dst.stream, err)
 		return
 	}
 
@@ -322,9 +338,9 @@ func workerJob(ctx context.Context, worker string, bus *Bus) {
 		return
 	}
 
-	err = processMessage(ctx, bus, messages[0].Messages[0])
+	err = dst.processMessage(ctx, messages[0].Messages[0])
 	if err != nil {
-		bus.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
+		dst.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
 	}
 }
 
@@ -341,33 +357,33 @@ func workerJob(ctx context.Context, worker string, bus *Bus) {
 //
 // Returns:
 //   - error: An error if the receiver fails to start or execute, otherwise nil.
-func processMessage(ctx context.Context, bus *Bus, msg re.XMessage) error {
-	if _, ok := bus.receivers[msg.Values["receiver"].(string)]; ok {
-		err := bus.receivers[msg.Values["receiver"].(string)].Start(ctx, msg.Values)
+func (dst *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
+	if _, ok := dst.receivers[msg.Values["receiver"].(string)]; ok {
+		err := dst.receivers[msg.Values["receiver"].(string)].Start(ctx, msg.Values)
 		if err != nil {
-			bus.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
+			dst.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
 			// Retry the receiver
-			err = bus.RetryMessage(ctx, msg.Values)
+			err = dst.retryMessage(ctx, msg.Values)
 			if err != nil {
-				bus.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+				dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
 			}
 			return err
 		}
 
-		err = bus.receivers[msg.Values["receiver"].(string)].Execute()
+		err = dst.receivers[msg.Values["receiver"].(string)].Execute()
 		if err != nil {
-			bus.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
+			dst.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
 			// Retry the receiver
-			err = bus.RetryMessage(ctx, msg.Values)
+			err = dst.retryMessage(ctx, msg.Values)
 			if err != nil {
-				bus.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
+				dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
 			}
 			return err
 		}
 
-		bus.receivers[msg.Values["receiver"].(string)].Finish()
+		dst.receivers[msg.Values["receiver"].(string)].Finish()
 	}
-	bus.redis.XAck(ctx, bus.stream, bus.group, msg.ID)
+	dst.redis.XAck(ctx, dst.stream, dst.group, msg.ID)
 
 	return nil
 }

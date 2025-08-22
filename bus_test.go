@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -31,6 +32,36 @@ func (t *TestReceiver) Execute() error {
 
 	logging.Logs.Infof(t.Ctx, "Executing TestReceiver with payload: %+v", t.Payload)
 	return nil
+}
+
+type TestErrorReceiver struct {
+	Payload ReceiverPayload
+	Receiver
+}
+
+func (t *TestErrorReceiver) Execute() error {
+	if err := json.Unmarshal([]byte(t.payload), &t.Payload); err != nil {
+		logging.Logs.Errorf(t.Ctx, "Receiver %q load payload: %v", t.task, err)
+		return nil
+	}
+
+	logging.Logs.Infof(t.Ctx, "Executing TestReceiver with payload: %+v", t.Payload)
+	return fmt.Errorf("simulated error in TestErrorReceiver")
+}
+
+type TestPanicReceiver struct {
+	Payload ReceiverPayload
+	Receiver
+}
+
+func (t *TestPanicReceiver) Execute() error {
+	if err := json.Unmarshal([]byte(t.payload), &t.Payload); err != nil {
+		logging.Logs.Errorf(t.Ctx, "Receiver %q load payload: %v", t.task, err)
+		return nil
+	}
+
+	logging.Logs.Infof(t.Ctx, "Executing TestReceiver with payload: %+v", t.Payload)
+	panic("simulated panic in TestPanicReceiver")
 }
 
 func Test(t *testing.T) {
@@ -75,6 +106,10 @@ func Test(t *testing.T) {
 
 	bus.RegisterReceiver(ctx, "receiver", testTask)
 	require.NotNil(t, bus.receivers["receiver"], "Receiver should be registered")
+	bus.RegisterReceiver(ctx, "error_receiver", &TestErrorReceiver{})
+	require.NotNil(t, bus.receivers["error_receiver"], "Error Receiver should be registered")
+	bus.RegisterReceiver(ctx, "panic_receiver", &TestPanicReceiver{})
+	require.NotNil(t, bus.receivers["panic_receiver"], "Panic Receiver should be registered")
 
 	timerCtx, cancel := context.WithTimeout(ctx, time.Second*2)
 	defer cancel()
@@ -82,6 +117,15 @@ func Test(t *testing.T) {
 	go bus.Start(timerCtx)
 
 	bus.AddMessage(ctx, "receiver", ReceiverPayload{
+		Title: faker.Sentence(5),
+		Foo:   faker.Word(),
+	})
+
+	bus.AddMessage(ctx, "error_receiver", ReceiverPayload{
+		Title: faker.Sentence(5),
+		Foo:   faker.Word(),
+	})
+	bus.AddMessage(ctx, "panic_receiver", ReceiverPayload{
 		Title: faker.Sentence(5),
 		Foo:   faker.Word(),
 	})
