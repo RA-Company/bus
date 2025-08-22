@@ -342,7 +342,7 @@ func (dst *Bus) workerJob(ctx context.Context, worker string) {
 
 	err = dst.processMessage(ctx, messages[0].Messages[0])
 	if err != nil {
-		dst.Error(ctx, "Failed to process message %q: %v", messages[0].Messages[0].Values["id"], err)
+		dst.Error(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
 	}
 }
 
