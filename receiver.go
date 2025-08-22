@@ -24,7 +24,7 @@ type Receiver struct {
 }
 
 func (dst *Receiver) Start(ctx context.Context, task map[string]any) error {
-	dst.preloadVariables(ctx, task)
+	dst.PreloadVariables(ctx, task)
 
 	logging.Logs.Infof(dst.Ctx, "Receiver %q is starting...", dst.task)
 
@@ -42,7 +42,15 @@ func (dst *Receiver) Execute() error {
 	return nil
 }
 
-func (dst *Receiver) preloadVariables(ctx context.Context, task map[string]any) error {
+// PreloadVariables preloads variables from the task map into the Receiver struct.
+//
+// Parameters:
+//   - ctx: The context for logging and tracing.
+//   - task: A map containing task details.
+//
+// Returns:
+//   - error: An error if any issues occur during variable preloading.
+func (dst *Receiver) PreloadVariables(ctx context.Context, task map[string]any) error {
 	dst.start = time.Now()
 	if task == nil {
 		return nil
@@ -81,4 +89,12 @@ func (dst *Receiver) preloadVariables(ctx context.Context, task map[string]any) 
 	dst.Ctx = context.WithValue(ctx, logging.CtxKeyUUID, dst.id.String())
 
 	return nil
+}
+
+// Payload returns the payload of the receiver.
+//
+// Returns:
+//   - string: The payload of the receiver.
+func (dst *Receiver) Payload() string {
+	return dst.payload
 }
