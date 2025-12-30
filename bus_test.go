@@ -45,6 +45,17 @@ func (t *TestErrorReceiver) Execute() error {
 		return nil
 	}
 
+	if str, err := redis.Redis.Get(t.Ctx, "error_test", ""); err != nil {
+		logging.Logs.Errorf(t.Ctx, "Receiver %q get redis key error: %v", t.task, err)
+		return err
+	} else {
+		str = fmt.Sprintf("%sb", str)
+		if err = redis.Redis.Set(t.Ctx, "error_test", str, 0); err != nil {
+			logging.Logs.Errorf(t.Ctx, "Receiver %q set redis key error: %v", t.task, err)
+			return err
+		}
+	}
+
 	logging.Logs.Infof(t.Ctx, "Executing TestReceiver with payload: %+v", t.Payload)
 	return fmt.Errorf("simulated error in TestErrorReceiver")
 }
@@ -74,13 +85,17 @@ func Test(t *testing.T) {
 	numRetries := faker.Number(1, 5)
 	bus := &Bus{}
 
-	redisHosts := env.GetEnvStr("REDIS_HOSTS", "localhost:6379")
+	redisHosts := env.GetEnvStr("REDIS_HOSTS", "")
 	require.NotEmpty(t, redisHosts, "REDIS_HOSTS should not be empty")
 	redisPassword := env.GetEnvStr("REDIS_PWD", "-")
 	redisDB := env.GetEnvInt("REDIS_DB", -1)
 	require.GreaterOrEqual(t, redisDB, 0, "REDIS_DB should be defined")
 
 	redis.Redis.Start(ctx, redisHosts, redisPassword, redisDB)
+
+	err := redis.Redis.Set(ctx, "error_test", "b", 0)
+	require.NoError(t, err, "Should set test key in Redis")
+	defer redis.Redis.Del(ctx, "error_test")
 
 	bus.Init(ctx, &BusConfiguration{
 		Redis: RedisConfiguration{
@@ -89,10 +104,11 @@ func Test(t *testing.T) {
 			DB:              redisDB,
 			DoNotLogQueries: false, // Enable query logging for tests
 		},
-		Stream:       stream,
-		Group:        group,
-		WorkersCount: workersCount,
-		NumRetries:   numRetries,
+		Stream:         stream,
+		Group:          group,
+		WorkersCount:   workersCount,
+		NumRetries:     numRetries,
+		RetryIddleTime: 1,
 	})
 	require.NotNil(t, bus.redis, "Redis client should be initialized")
 	require.NotEmpty(t, bus.stream, "Stream should be set")
@@ -109,7 +125,7 @@ func Test(t *testing.T) {
 	bus.RegisterReceiver(ctx, "panic_receiver", func() ReceiverInterface { return &TestPanicReceiver{} })
 	require.NotNil(t, bus.receivers["panic_receiver"], "Panic Receiver should be registered")
 
-	timerCtx, cancel := context.WithTimeout(ctx, time.Second*2)
+	timerCtx, cancel := context.WithTimeout(ctx, time.Second*15)
 	defer cancel()
 
 	go bus.Start(timerCtx)
@@ -128,5 +144,10 @@ func Test(t *testing.T) {
 		Foo:   faker.Word(),
 	})
 
-	time.Sleep(time.Second * 3)
+	time.Sleep(time.Second * 20)
+
+	var str string
+	str, err = redis.Redis.Get(t.Context(), "error_test", "")
+	require.NoError(t, err, "Should get test key from Redis")
+	require.Equal(t, numRetries+1, len(str), "Error receiver should have retried the expected number of times")
 }

@@ -26,22 +26,24 @@ var (
 
 type Bus struct {
 	logging.CustomLogger
-	redis        *redis.RedisClient
-	stream       string                     // Stream name for the bus
-	group        string                     // Consumer group name
-	workersCount int                        // Number of workers to process tasks
-	numRetries   int                        // Number of retries for failed tasks
-	streamSize   int                        // Maximum size of the stream
-	receivers    map[string]ReceiverFactory // Map of receivers by name
+	redis          *redis.RedisClient
+	stream         string                     // Stream name for the bus
+	group          string                     // Consumer group name
+	workersCount   int                        // Number of workers to process tasks (default: 10)
+	numRetries     int                        // Number of retries for failed tasks (default: 5)
+	streamSize     int                        // Maximum size of the stream (default: 10000)
+	retryIddleTime int                        // Minimum idle time in seconds before retrying a message (default: 60 seconds)
+	receivers      map[string]ReceiverFactory // Map of receivers by name
 }
 
 type BusConfiguration struct {
-	Redis        RedisConfiguration // Configuration for Redis connection
-	Stream       string             // Stream name for the bus
-	Group        string             // Consumer group name
-	WorkersCount int                // Number of workers to process tasks
-	NumRetries   int                // Number of retries for failed tasks
-	StreamSize   int                // Maximum size of the stream
+	Redis          RedisConfiguration // Configuration for Redis connection
+	Stream         string             // Stream name for the bus
+	Group          string             // Consumer group name
+	WorkersCount   int                // Number of workers to process tasks
+	NumRetries     int                // Number of retries for failed tasks
+	StreamSize     int                // Maximum size of the stream
+	RetryIddleTime int                // Minimum idle time before retrying a message (in seconds)
 }
 
 type RedisConfiguration struct {
@@ -104,6 +106,11 @@ func (dst *Bus) Init(ctx context.Context, config *BusConfiguration) {
 	dst.streamSize = config.StreamSize
 	if dst.streamSize <= 0 {
 		dst.streamSize = 10000 // Default to 10000 messages in the stream if not provided or invalid
+	}
+
+	dst.retryIddleTime = config.RetryIddleTime
+	if dst.retryIddleTime <= 0 {
+		dst.retryIddleTime = 60 // Default to 60 seconds (1 minute) if not provided or invalid
 	}
 
 	err := dst.redis.XGroupCreateMkStream(ctx, dst.stream, dst.group, "$")
@@ -196,7 +203,6 @@ func (dst *Bus) AddMessage(ctx context.Context, receiver string, payload any) (s
 		"id":       id,                                        // Unique ID for the message
 		"payload":  string(data),                              // Serialized payload
 		"time":     time.Now().UTC().Format(time.RFC3339Nano), // Current time in RFC3339Nano format
-		"retry":    0,                                         // Retry count initialized to 0
 	}
 
 	_, err = dst.redis.XAdd(ctx, &re.XAddArgs{
@@ -212,43 +218,6 @@ func (dst *Bus) AddMessage(ctx context.Context, receiver string, payload any) (s
 	dst.Info(ctx, "Message %q added to stream %q with ID %q", receiver, dst.stream, id)
 
 	return id, nil
-}
-
-// retryMessage retries a message by adding it back to the stream with an incremented retry count.
-// If the retry count exceeds the configured limit, it does not add the message back to the stream.
-// This method is useful for handling failed messages and implementing retry logic.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - message: The message to retry, which should contain the message ID and other necessary data.
-//
-// Returns:
-//   - error: An error if the retry operation fails, otherwise nil.
-func (dst *Bus) retryMessage(ctx context.Context, message map[string]any) error {
-	if message == nil {
-		return fmt.Errorf("message cannot be nil")
-	}
-
-	var err error
-	retry := 0
-	if _, ok := message["retry"]; ok {
-		retry, err = strconv.Atoi(message["retry"].(string))
-		if err != nil {
-			retry = 0
-		}
-	}
-
-	message["retry"] = retry + 1 // Increment retry count
-	if retry > dst.numRetries {
-		return nil
-	}
-
-	if _, err := dst.redis.XAdd(ctx, &re.XAddArgs{Stream: dst.stream, Values: message}); err != nil {
-		dst.Error(ctx, "dst.redis.XAdd() error: %v", err)
-		return err
-	}
-
-	return nil
 }
 
 // safeWorker is a wrapper around the worker function that recovers from panics.
@@ -299,7 +268,7 @@ func (dst *Bus) workerJob(ctx context.Context, worker string) {
 		Stream:   dst.stream,
 		Group:    dst.group,
 		Consumer: worker,
-		MinIdle:  5 * time.Minute, // Minimum idle time for auto claim
+		MinIdle:  time.Duration(dst.retryIddleTime) * time.Second, // Minimum idle time for auto claim
 		Count:    1,
 		Start:    "0-0",
 	})
@@ -366,32 +335,91 @@ func (dst *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 		return ErrorReceiverNotRegistered
 	}
 
+	retry := dst.GetRetry(ctx, msg.ID)
+	retry += 1
+	if retry > dst.numRetries {
+		dst.DelRetry(ctx, msg.ID)
+		dst.redis.XAck(ctx, dst.stream, dst.group, msg.ID)
+		return nil
+	}
+	dst.SetRetry(ctx, msg.ID, retry)
+
 	receiver := factory()
 	err := receiver.Start(ctx, msg.Values)
 	if err != nil {
 		dst.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
-		// Retry the receiver
-		err = dst.retryMessage(ctx, msg.Values)
-		if err != nil {
-			dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
-		}
 		return err
 	}
 
 	err = receiver.Execute()
 	if err != nil {
 		dst.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
-		// Retry the receiver
-		err = dst.retryMessage(ctx, msg.Values)
-		if err != nil {
-			dst.Error(ctx, "Failed to retry message %q: %v", msg.Values["id"], err)
-		}
+		receiver.Finish()
 		return err
 	}
 
 	receiver.Finish()
 
 	dst.redis.XAck(ctx, dst.stream, dst.group, msg.ID)
+	dst.DelRetry(ctx, msg.ID)
 
 	return nil
+}
+
+// SetRetry sets the retry count for a specific message key in Redis.
+// It constructs a Redis key using the stream name and the provided key,
+// and sets the retry count as the value.
+// If setting the retry count fails, it logs an error.
+//
+// Parameters:
+//   - ctx: The context for the operation.
+//   - key: The unique key for the message whose retry count is to be set.
+//   - num: The retry count to set for the specified message key.
+func (dst *Bus) SetRetry(ctx context.Context, key string, num int) {
+	err := dst.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", dst.stream, key), strconv.Itoa(num), dst.numRetries*dst.retryIddleTime*3)
+	if err != nil {
+		dst.Error(ctx, "Failed to set retry count for key %q: %v", key, err)
+	}
+}
+
+// GetRetry retrieves the retry count for a specific message key from Redis.
+// It constructs a Redis key using the stream name and the provided key,
+// and retrieves the retry count value.
+// If retrieving the retry count fails, it logs an error and returns -1.
+// If the retrieved value cannot be converted to an integer, it also returns -1.
+//
+// Parameters:
+//   - ctx: The context for the operation.
+//   - key: The unique key for the message whose retry count is to be retrieved.
+//
+// Returns:
+//   - int: The retry count for the specified message key, or -1 if an error occurs.
+func (dst *Bus) GetRetry(ctx context.Context, key string) int {
+	val, err := dst.redis.Get(ctx, fmt.Sprintf("%s:retry:%s", dst.stream, key), "0")
+	if err != nil {
+		dst.Error(ctx, "Failed to get retry count for key %q: %v", key, err)
+		return 1000
+	}
+
+	num, err := strconv.Atoi(val)
+	if err != nil {
+		return 1000
+	}
+
+	return num
+}
+
+// DelRetry deletes the retry count for a specific message key from Redis.
+// It constructs a Redis key using the stream name and the provided key,
+// and deletes the corresponding entry from Redis.
+// If deleting the retry count fails, it logs an error.
+//
+// Parameters:
+//   - ctx: The context for the operation.
+//   - key: The unique key for the message whose retry count is to be deleted.
+func (dst *Bus) DelRetry(ctx context.Context, key string) {
+	err := dst.redis.Del(ctx, fmt.Sprintf("%s:retry:%s", dst.stream, key))
+	if err != nil {
+		dst.Error(ctx, "Failed to delete retry count for key %q: %v", key, err)
+	}
 }
