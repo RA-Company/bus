@@ -2,6 +2,7 @@
 .air.toml
 .env
 .test.env
+.claude
 tmp
 
 # Visual Studio Code

@@ -9,9 +9,9 @@ import (
 )
 
 type ReceiverInterface interface {
-	Start(ctx context.Context, task map[string]any) error
-	Finish()
-	Execute() error
+	Start(ctx context.Context, task map[string]any) (context.Context, error)
+	Finish(ctx context.Context)
+	Execute(ctx context.Context) error
 }
 
 type ReceiverFactory func() ReceiverInterface
@@ -22,26 +22,29 @@ type Receiver struct {
 	payload string
 	event   time.Time
 	id      uuid.UUID
-	Ctx     context.Context
 }
 
-func (dst *Receiver) Start(ctx context.Context, task map[string]any) error {
-	dst.PreloadVariables(ctx, task)
+func (r *Receiver) Start(ctx context.Context, task map[string]any) (context.Context, error) {
+	var err error
+	if ctx, err = r.PreloadVariables(ctx, task); err != nil {
+		logging.Logs.Errorf(ctx, "Failed to preload variables for receiver %q: %v", r.task, err)
+		return ctx, err
+	}
 
-	logging.Logs.Infof(dst.Ctx, "Receiver %q is starting...", dst.task)
+	logging.Logs.Infof(ctx, "Receiver %q is starting...", r.task)
 
-	return nil
+	return ctx, nil
 }
 
-func (dst *Receiver) Finish() {
-	logging.Logs.Infof(dst.Ctx, "Receiver %q was finished (%.2fms).", dst.task, float64(time.Since(dst.start))/1000000)
+func (r *Receiver) Finish(ctx context.Context) {
+	logging.Logs.Infof(ctx, "Receiver %q was finished (%.2fms).", r.task, float64(time.Since(r.start))/1000000)
 }
 
-func (dst *Receiver) Execute() error {
+func (r *Receiver) Execute(ctx context.Context) error {
 	// Simulate receiver execution
-	logging.Logs.Infof(dst.Ctx, "Executing receiver %q...", dst.task)
+	logging.Logs.Infof(ctx, "Executing receiver %q...", r.task)
 	time.Sleep(100 * time.Millisecond) // Simulate some work
-	return nil
+	panic("Simulated execution error") // Simulate an error during execution
 }
 
 // PreloadVariables preloads variables from the task map into the Receiver struct.
@@ -52,51 +55,60 @@ func (dst *Receiver) Execute() error {
 //
 // Returns:
 //   - error: An error if any issues occur during variable preloading.
-func (dst *Receiver) PreloadVariables(ctx context.Context, task map[string]any) error {
-	dst.start = time.Now()
+func (r *Receiver) PreloadVariables(ctx context.Context, task map[string]any) (context.Context, error) {
+	r.start = time.Now()
 	if task == nil {
-		return nil
+		return ctx, ErrorEmptyTask
 	}
 
 	if val, ok := task["receiver"]; ok {
-		dst.task = val.(string)
+		r.task = getString(val)
+	} else {
+		return ctx, ErrorInvalidReceiverName
 	}
 
 	if val, ok := task["payload"]; ok {
-		dst.payload = val.(string)
+		r.payload = getString(val)
+	} else {
+		r.payload = ""
 	}
 
+	var err error
 	if val, ok := task["event"]; ok {
-		var err error
-		dst.event, err = time.Parse(time.RFC3339Nano, val.(string))
-		if err != nil {
+		if r.event, err = time.Parse(time.RFC3339Nano, getString(val)); err != nil {
 			logging.Logs.Errorf(ctx, "Failed to parse event time: %v", err)
-			return err
+			r.event = time.Now().UTC()
 		}
 	} else {
-		dst.event = time.Now().UTC()
+		r.event = time.Now().UTC()
 	}
 
 	if val, ok := task["id"]; ok {
-		var err error
-		dst.id, err = uuid.Parse(val.(string))
+		r.id, err = uuid.Parse(getString(val))
 		if err != nil {
 			logging.Logs.Errorf(ctx, "Failed to parse task ID: %v", err)
-			return err
+			r.id = uuid.New()
 		}
 	} else {
-		dst.id = uuid.New()
+		r.id = uuid.New()
 	}
 
-	dst.Ctx = context.WithValue(ctx, logging.CtxKeyUUID, dst.id.String())
+	ctx = context.WithValue(ctx, logging.CtxKeyUUID, r.id.String())
 
-	return nil
+	return ctx, nil
 }
 
 // Payload returns the payload of the receiver.
 //
 // Returns:
 //   - string: The payload of the receiver.
-func (dst *Receiver) Payload() string {
-	return dst.payload
+func (r *Receiver) Payload() string {
+	return r.payload
+}
+
+func getString(val any) string {
+	if str, ok := val.(string); ok {
+		return str
+	}
+	return ""
 }
