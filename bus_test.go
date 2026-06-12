@@ -126,11 +126,17 @@ func Test(t *testing.T) {
 	defer redis.XGroupDestroy(ctx, bus.stream, bus.group)
 
 	bus.RegisterReceiver(ctx, "receiver", func() ReceiverInterface { return &TestReceiver{} })
-	require.NotNil(t, bus.receivers["receiver"], "Receiver should be registered")
+	receiver, ok := bus.GetReceiver("receiver")
+	require.True(t, ok, "Receiver should be registered")
+	require.NotNil(t, receiver, "Receiver should not be nil")
 	bus.RegisterReceiver(ctx, "error_receiver", func() ReceiverInterface { return newTestErrorReceiver(ctx, config) })
-	require.NotNil(t, bus.receivers["error_receiver"], "Error Receiver should be registered")
+	errorReceiver, ok := bus.GetReceiver("error_receiver")
+	require.True(t, ok, "Error Receiver should be registered")
+	require.NotNil(t, errorReceiver, "Error Receiver should not be nil")
 	bus.RegisterReceiver(ctx, "panic_receiver", func() ReceiverInterface { return &TestPanicReceiver{} })
-	require.NotNil(t, bus.receivers["panic_receiver"], "Panic Receiver should be registered")
+	panicReceiver, ok := bus.GetReceiver("panic_receiver")
+	require.True(t, ok, "Panic Receiver should be registered")
+	require.NotNil(t, panicReceiver, "Panic Receiver should not be nil")
 
 	timerCtx, cancel := context.WithTimeout(ctx, time.Second*15)
 	defer cancel()
@@ -151,12 +157,11 @@ func Test(t *testing.T) {
 		Foo:   faker.Word(),
 	})
 
-	time.Sleep(time.Second * 20)
-
-	var str string
-	str, err = redis.Get(t.Context(), "error_test", "")
-	require.NoError(t, err, "Should get test key from Redis")
-	require.Equal(t, numRetries+1, len(str), "Error receiver should have retried the expected number of times")
+	require.Eventually(t, func() bool {
+		str, err := redis.Get(t.Context(), "error_test", "")
+		return err == nil && len(str) == numRetries+1
+	}, 20*time.Second, 500*time.Millisecond,
+		"error receiver should have retried %d times", numRetries)
 }
 
 // redisConfig reads Redis connection parameters from environment variables and
@@ -225,13 +230,15 @@ func TestBus_RegisterReceiver(t *testing.T) {
 	t.Run("empty title is a no-op", func(t *testing.T) {
 		b := &Bus{receivers: make(map[string]ReceiverFactory)}
 		b.RegisterReceiver(ctx, "", factory)
-		require.Len(t, b.receivers, 0)
+		require.Equal(t, 0, b.ReceiversCount(), "No receiver should be registered for empty title")
 	})
 
 	t.Run("registers factory under given title", func(t *testing.T) {
 		b := &Bus{receivers: make(map[string]ReceiverFactory)}
 		b.RegisterReceiver(ctx, "recv", factory)
-		require.NotNil(t, b.receivers["recv"])
+		receiver, ok := b.GetReceiver("recv")
+		require.True(t, ok, "Receiver should be registered")
+		require.NotNil(t, receiver, "Receiver should not be nil")
 	})
 
 	t.Run("second call overwrites existing entry", func(t *testing.T) {
@@ -239,14 +246,18 @@ func TestBus_RegisterReceiver(t *testing.T) {
 		b.RegisterReceiver(ctx, "recv", factory)
 		factory2 := func() ReceiverInterface { return &TestErrorReceiver{} }
 		b.RegisterReceiver(ctx, "recv", factory2)
-		require.Len(t, b.receivers, 1)
-		require.NotNil(t, b.receivers["recv"])
+		require.Equal(t, 1, b.ReceiversCount(), "Only one receiver should be registered")
+		receiver, ok := b.GetReceiver("recv")
+		require.True(t, ok, "Receiver should be registered")
+		require.NotNil(t, receiver, "Receiver should not be nil")
 	})
 
 	t.Run("nil map is initialised on first call", func(t *testing.T) {
 		b := &Bus{}
 		b.RegisterReceiver(ctx, "recv", factory)
-		require.NotNil(t, b.receivers["recv"])
+		receiver, ok := b.GetReceiver("recv")
+		require.True(t, ok, "Receiver should be registered")
+		require.NotNil(t, receiver, "Receiver should not be nil")
 	})
 }
 
@@ -339,19 +350,6 @@ func TestBus_RetryManagement(t *testing.T) {
 	})
 }
 
-// TestBus_RegisterReceiver_AfterStarted verifies that RegisterReceiver is a
-// no-op once the bus has been started.
-func TestBus_RegisterReceiver_AfterStarted(t *testing.T) {
-	ctx := t.Context()
-	b := &Bus{
-		receivers: make(map[string]ReceiverFactory),
-	}
-	b.started.Store(true) // Simulate that the bus has already been started
-	factory := func() ReceiverInterface { return &TestReceiver{} }
-	b.RegisterReceiver(ctx, "recv", factory)
-	require.Len(t, b.receivers, 0, "RegisterReceiver after Start should be a no-op")
-}
-
 // TestProcessMessage_InvalidReceiverField verifies that a message whose
 // "receiver" field is not a string is ACKed and returns ErrorInvalidReceiverName.
 func TestProcessMessage_InvalidReceiverField(t *testing.T) {
@@ -401,8 +399,10 @@ func TestProcessMessage_RetryExceeded(t *testing.T) {
 	})
 	defer rdb.XGroupDestroy(context.Background(), b.stream, b.group)
 
+	b.mu.Lock()
 	b.receivers = make(map[string]ReceiverFactory)
 	b.receivers["recv"] = func() ReceiverInterface { return &TestReceiver{} }
+	b.mu.Unlock()
 
 	ctx := t.Context()
 	msgID := "1-0"

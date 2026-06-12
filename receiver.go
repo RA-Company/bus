@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,15 @@ type Receiver struct {
 	id      uuid.UUID
 }
 
+// Start initializes the receiver by preloading variables from the task map and logging the start of execution.
+//
+// Parameters:
+//   - ctx: The context for logging and tracing.
+//   - task: A map containing task details.
+//
+// Returns:
+//   - context.Context: The updated context with preloaded variables.
+//   - error: An error if any issues occur during initialization.
 func (r *Receiver) Start(ctx context.Context, task map[string]any) (context.Context, error) {
 	var err error
 	if ctx, err = r.PreloadVariables(ctx, task); err != nil {
@@ -36,15 +46,23 @@ func (r *Receiver) Start(ctx context.Context, task map[string]any) (context.Cont
 	return ctx, nil
 }
 
+// Finish logs the completion of the receiver execution along with the time taken.
+//
+// Parameters:
+//   - ctx: The context for logging and tracing.
 func (r *Receiver) Finish(ctx context.Context) {
-	logging.Logs.Infof(ctx, "Receiver %q was finished (%.2fms).", r.task, float64(time.Since(r.start))/1000000)
+	logging.Logs.Infof(ctx, "Receiver %q was finished (%.2fms).", r.task, float64(time.Since(r.start))/float64(time.Millisecond))
 }
 
-func (r *Receiver) Execute(ctx context.Context) error {
-	// Simulate receiver execution
-	logging.Logs.Infof(ctx, "Executing receiver %q...", r.task)
-	time.Sleep(100 * time.Millisecond) // Simulate some work
-	panic("Simulated execution error") // Simulate an error during execution
+// Execute is a placeholder method that should be overridden by specific receiver implementations.
+//
+// Parameters:
+//   - ctx: The context for the receiver execution, used for cancellation and timeout.
+//
+// Returns:
+//   - error: An error if any issues occur during execution. By default, it panics to indicate that it should be implemented by specific receivers.
+func (r *Receiver) Execute(_ context.Context) error {
+	panic(fmt.Sprintf("Execute not implemented for receiver %q", r.task))
 }
 
 // PreloadVariables preloads variables from the task map into the Receiver struct.

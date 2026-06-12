@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -28,6 +28,8 @@ var (
 	ErrorEmptyTask             = fmt.Errorf("task cannot be empty")
 )
 
+const retryFailed = math.MaxInt // A large number to indicate that a message should not be retried anymore
+
 type Bus struct {
 	logging.CustomLogger
 	redis         *redis.RedisClient
@@ -37,8 +39,8 @@ type Bus struct {
 	numRetries    int                        // Number of retries for failed tasks (default: 5)
 	streamSize    int                        // Maximum size of the stream (default: 10000)
 	retryIdleTime int                        // Minimum idle time in seconds before retrying a message (default: 60 seconds)
-	receivers     map[string]ReceiverFactory // Map of receivers by name (Register a receiver is not possible after starting)
-	started       atomic.Bool                // Indicates whether the bus has been started
+	receivers     map[string]ReceiverFactory // Map of receivers by name
+	mu            sync.RWMutex               // Mutex to protect access to the receivers map
 }
 
 type BusConfiguration struct {
@@ -122,16 +124,18 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 // If the receiver is already registered, it logs a warning and overwrites the existing receiver.
 // If the receiver is registered successfully, it logs an info message.
 // This method is useful for dynamically adding or updating receivers in the bus system.
+// Receivers should be registered before starting the bus, but it is possible to register new receivers after
+// starting the bus as well. However, it is recommended to register all necessary receivers before starting the bus
+// to avoid potential issues with processing messages that require unregistered receivers.
 //
 // Parameters:
 //   - ctx: The context for the operation, used for cancellation and timeout.
 //   - title: The title of the receiver to register.
 //   - receiver: The ReceiverInterface implementation that defines the receiver's behavior.
 func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver ReceiverFactory) {
-	if b.started.Load() {
-		b.Warn(ctx, "Cannot register receiver %q after the bus has been started", title)
-		return
-	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	if title == "" {
 		b.Error(ctx, "Receiver title cannot be empty")
 		return
@@ -149,6 +153,51 @@ func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver Recei
 	b.Info(ctx, "Receiver %q registered successfully", title)
 }
 
+// GetReceiver retrieves a registered receiver by its title.
+// It returns the ReceiverFactory and a boolean indicating whether the receiver was found.
+// If the receivers map is nil or if the receiver with the specified title does not exist, it returns nil and false.
+// This method is useful for retrieving a receiver when processing messages from the bus, allowing you to execute
+// the appropriate logic based on the receiver's implementation.
+//
+// Parameters:
+//   - title: The title of the receiver to retrieve.
+//
+// Returns:
+//   - ReceiverFactory: The factory function for creating an instance of the receiver, or nil if not found.
+//   - bool: A boolean indicating whether the receiver was found (true) or not (false).
+func (b *Bus) GetReceiver(title string) (ReceiverFactory, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if b.receivers == nil {
+		return nil, false
+	}
+
+	if receiver, exists := b.receivers[title]; exists {
+		return receiver, true
+	}
+
+	return nil, false
+}
+
+// ReceiversCount returns the number of registered receivers in the bus.
+// It acquires a read lock to safely access the receivers map and returns the count of registered receivers.
+// If the receivers map is nil, it returns 0.
+// This method is useful for monitoring and debugging purposes, allowing you to check how many receivers are currently registered in the bus.
+//
+// Returns:
+//   - int: The number of registered receivers in the bus.
+func (b *Bus) ReceiversCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if b.receivers == nil {
+		return 0
+	}
+
+	return len(b.receivers)
+}
+
 // Start starts the bus by launching the specified number of worker goroutines.
 // Each worker will continuously process tasks from the Redis stream.
 // It waits for all workers to finish before returning.
@@ -158,7 +207,6 @@ func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver Recei
 // Parameters:
 //   - ctx: The context for the operation, used for cancellation and timeout.
 func (b *Bus) Start(ctx context.Context) {
-	b.started.Store(true)
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -262,10 +310,8 @@ func (b *Bus) safeWorker(ctx context.Context) {
 //
 // Parameters:
 //   - ctx: The context for the worker, used for cancellation and timeout.
-//   - bus: The Bus instance that contains the Redis client and task definitions.
+//   - worker: The unique identifier for the worker, used for logging and claiming messages.
 func (b *Bus) workerJob(ctx context.Context, worker string) {
-
-	// Local panic recovery
 	claims, err := b.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
 		Stream:   b.stream,
 		Group:    b.group,
@@ -277,26 +323,18 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 
 	if err != nil {
 		b.Error(ctx, "Failed to auto claim message: %v", err)
-		time.Sleep(5 * time.Second) // Wait before retrying
+		// Wait before retrying and check for context cancellation to avoid tight loop on errors
+		select {
+		case <-time.After(5 * time.Second):
+		case <-ctx.Done():
+			return
+		}
 		return
 	}
 
 	if len(claims) == 1 {
-		receiverName, ok := claims[0].Values["receiver"].(string)
-		if !ok {
-			b.redis.XAck(ctx, b.stream, b.group, claims[0].ID)
-			b.Error(ctx, "Message %q does not contain a valid receiver name", claims[0].ID)
-			return
-		}
-		if _, ok := b.receivers[receiverName]; ok {
-			err = b.processMessage(ctx, claims[0])
-			if err != nil {
-				b.Error(ctx, "Failed to execute receiver %q: %v", receiverName, err)
-			}
-		} else {
-			b.redis.XAck(ctx, b.stream, b.group, claims[0].ID)
-			b.Error(ctx, "Receiver %q is not registered for message %q", receiverName, claims[0].ID)
-			return
+		if err = b.processMessage(ctx, claims[0]); err != nil {
+			b.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
 		}
 		return
 	}
@@ -335,7 +373,6 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 //
 // Parameters:
 //   - ctx: The context for the operation.
-//   - bus: The Bus instance that contains the Redis client and receivers definitions.
 //   - msg: The message containing the receiver data, which should include the receiver title and other necessary information.
 //
 // Returns:
@@ -347,20 +384,23 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 		b.Error(ctx, "Message %q does not contain a valid receiver name", msg.ID)
 		return ErrorInvalidReceiverName
 	}
+
+	b.mu.RLock()
 	factory, ok := b.receivers[receiverName]
+	b.mu.RUnlock()
 	if !ok {
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 		return ErrorReceiverNotRegistered
 	}
 
 	retry := b.GetRetry(ctx, msg.ID)
-	retry += 1
-	if retry > b.numRetries {
+	if retry >= b.numRetries {
 		b.Warn(ctx, "Message %q exceeded retry limit (%d), discarding", msg.ID, b.numRetries)
 		b.DelRetry(ctx, msg.ID)
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 		return nil
 	}
+	retry++
 	b.SetRetry(ctx, msg.ID, retry)
 
 	var err error
@@ -398,6 +438,7 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 //   - key: The unique key for the message whose retry count is to be set.
 //   - num: The retry count to set for the specified message key.
 func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
+	// Set the retry count in Redis with a TTL in a seconds. Time multiplied by 3 to ensure that all retries have enough time to be attempted before the retry count expires.
 	err := b.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), strconv.Itoa(num), b.numRetries*b.retryIdleTime*3)
 	if err != nil {
 		b.Error(ctx, "Failed to set retry count for key %q: %v", key, err)
@@ -407,25 +448,25 @@ func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
 // GetRetry retrieves the retry count for a specific message key from Redis.
 // It constructs a Redis key using the stream name and the provided key,
 // and retrieves the retry count value.
-// If retrieving the retry count fails, it logs an error and returns 1000 for end retrying.
-// If the retrieved value cannot be converted to an integer, it also returns 1000.
+// If retrieving the retry count fails, it logs an error and returns retryFailed for end retrying.
+// If the retrieved value cannot be converted to an integer, it also returns retryFailed.
 //
 // Parameters:
 //   - ctx: The context for the operation.
 //   - key: The unique key for the message whose retry count is to be retrieved.
 //
 // Returns:
-//   - int: The retry count for the specified message key, or 1000 if an error occurs.
+//   - int: The retry count for the specified message key, or retryFailed if an error occurs.
 func (b *Bus) GetRetry(ctx context.Context, key string) int {
 	val, err := b.redis.Get(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), "0")
 	if err != nil {
 		b.Error(ctx, "Failed to get retry count for key %q: %v", key, err)
-		return 1000
+		return retryFailed
 	}
 
 	num, err := strconv.Atoi(val)
 	if err != nil {
-		return 1000
+		return retryFailed
 	}
 
 	return num
