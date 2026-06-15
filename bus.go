@@ -8,10 +8,13 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,22 +38,23 @@ type Bus struct {
 	redis         *redis.RedisClient
 	stream        string                     // Stream name for the bus
 	group         string                     // Consumer group name
-	workersCount  int                        // Number of workers to process tasks (default: 10)
-	numRetries    int                        // Number of retries for failed tasks (default: 5)
-	streamSize    int                        // Maximum size of the stream (default: 10000)
-	retryIdleTime int                        // Minimum idle time in seconds before retrying a message (default: 60 seconds)
+	workersCount  int64                      // Number of workers to process tasks (default: 10)
+	numRetries    int64                      // Number of retries for failed tasks (default: 5)
+	streamSize    int64                      // Maximum size of the stream (default: 10000)
+	retryIdleTime int64                      // Minimum idle time in seconds before retrying a message (default: 60 seconds)
 	receivers     map[string]ReceiverFactory // Map of receivers by name
 	mu            sync.RWMutex               // Mutex to protect access to the receivers map
+	inFlight      atomic.Int64               // Counter for the number of messages currently being processed
 }
 
 type BusConfiguration struct {
 	Redis         redis.Config // Configuration for Redis connection
 	Stream        string       // Stream name for the bus
 	Group         string       // Consumer group name
-	WorkersCount  int          // Number of workers to process tasks
-	NumRetries    int          // Number of retries for failed tasks
-	StreamSize    int          // Maximum size of the stream
-	RetryIdleTime int          // Minimum idle time before retrying a message (in seconds)
+	WorkersCount  int64        // Number of workers to process tasks
+	NumRetries    int64        // Number of retries for failed tasks
+	StreamSize    int64        // Maximum size of the stream
+	RetryIdleTime int64        // Minimum idle time before retrying a message (in seconds)
 }
 
 // SetLogger allows setting a custom logger for the bus.
@@ -212,7 +216,7 @@ func (b *Bus) Start(ctx context.Context) {
 
 	var wg sync.WaitGroup
 
-	for i := 0; i < b.workersCount; i++ {
+	for i := 0; i < int(b.workersCount); i++ {
 		wg.Go(func() {
 			b.safeWorker(ctx)
 		})
@@ -292,6 +296,7 @@ func (b *Bus) safeWorker(ctx context.Context) {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
+						b.inFlight.Add(-1) // Decrement in-flight counter if a panic occurs
 						b.Error(ctx, "[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
 					}
 				}()
@@ -394,7 +399,7 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	}
 
 	retry := b.GetRetry(ctx, msg.ID)
-	if retry >= b.numRetries {
+	if retry >= int(b.numRetries) {
 		b.Warn(ctx, "Message %q exceeded retry limit (%d), discarding", msg.ID, b.numRetries)
 		b.DelRetry(ctx, msg.ID)
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
@@ -405,8 +410,11 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 
 	var err error
 	receiver := factory()
+	b.inFlight.Add(1)
+	receiver.SetBusContext(&b.inFlight, b.workersCount)
 	ctx, err = receiver.Start(ctx, msg.Values)
 	if err != nil {
+		b.inFlight.Add(-1)
 		b.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
 		return err
 	}
@@ -415,10 +423,11 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	if err != nil {
 		b.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
 		receiver.Finish(ctx)
+		b.inFlight.Add(-1)
 		return err
 	}
-
 	receiver.Finish(ctx)
+	b.inFlight.Add(-1)
 
 	b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 	b.DelRetry(ctx, msg.ID)
@@ -439,7 +448,7 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 //   - num: The retry count to set for the specified message key.
 func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
 	// Set the retry count in Redis with a TTL in a seconds. Time multiplied by 3 to ensure that all retries have enough time to be attempted before the retry count expires.
-	err := b.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), strconv.Itoa(num), b.numRetries*b.retryIdleTime*3)
+	err := b.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), strconv.Itoa(num), int(b.numRetries*b.retryIdleTime*3))
 	if err != nil {
 		b.Error(ctx, "Failed to set retry count for key %q: %v", key, err)
 	}
@@ -485,4 +494,10 @@ func (b *Bus) DelRetry(ctx context.Context, key string) {
 	if err != nil {
 		b.Error(ctx, "Failed to delete retry count for key %q: %v", key, err)
 	}
+}
+
+func Caller() string {
+	pc, file, line, _ := runtime.Caller(1)
+	fn := runtime.FuncForPC(pc)
+	return fmt.Sprintf("%s:%d->%s", filepath.Base(file), line, strings.TrimPrefix(fn.Name(), "github.com/ra-company/bus/"))
 }
