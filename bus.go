@@ -96,7 +96,7 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 		b.workersCount = 10 // Default to 10 worker if not provided or invalid
 	}
 	if b.workersCount > 100 {
-		b.Warn(ctx, "Workers count is too high (%d), setting to 100", b.workersCount)
+		b.Warnf(ctx, "Workers count is too high (%d), setting to 100", b.workersCount)
 		b.workersCount = 100 // Cap the workers count to 100
 	}
 
@@ -117,7 +117,7 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 
 	err := b.redis.XGroupCreateMkStream(ctx, b.stream, b.group, "$")
 	if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
-		b.Error(ctx, "Failed to create group %s for stream %s: %v", b.group, b.stream, err)
+		b.Errorf(ctx, "Failed to create group %s for stream %s: %v", b.group, b.stream, err)
 		return err
 	}
 	return nil
@@ -150,11 +150,11 @@ func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver Recei
 	}
 
 	if _, exists := b.receivers[title]; exists {
-		b.Warn(ctx, "Receiver %q is already registered, overwriting it", title)
+		b.Warnf(ctx, "Receiver %q is already registered, overwriting it", title)
 	}
 
 	b.receivers[title] = receiver
-	b.Info(ctx, "Receiver %q registered successfully", title)
+	b.Infof(ctx, "Receiver %q registered successfully", title)
 }
 
 // GetReceiver retrieves a registered receiver by its title.
@@ -265,11 +265,11 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any) (str
 		MaxLen: int64(b.streamSize), // Limit the stream size
 	})
 	if err != nil {
-		b.Error(ctx, "b.redis.XAdd() error: %v", err)
+		b.Errorf(ctx, "b.redis.XAdd() error: %v", err)
 		return "", err
 	}
 
-	b.Info(ctx, "Message %q added to stream %q with ID %q", receiver, b.stream, id)
+	b.Infof(ctx, "Message %q added to stream %q with ID %q", receiver, b.stream, id)
 
 	return id, nil
 }
@@ -285,19 +285,19 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any) (str
 func (b *Bus) safeWorker(ctx context.Context) {
 	worker := uuid.New().String()
 	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
-	b.Info(ctx, "Worker %q was started", worker)
+	b.Infof(ctx, "Worker %q was started", worker)
 
 	for {
 		select {
 		case <-ctx.Done():
-			b.Info(ctx, "Worker %q was stopped", worker)
+			b.Infof(ctx, "Worker %q was stopped", worker)
 			return
 		default:
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
 						b.inFlight.Add(-1) // Decrement in-flight counter if a panic occurs
-						b.Error(ctx, "[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
+						b.Errorf(ctx, "[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
 					}
 				}()
 
@@ -327,7 +327,7 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 	})
 
 	if err != nil {
-		b.Error(ctx, "Failed to auto claim message: %v", err)
+		b.Errorf(ctx, "Failed to auto claim message: %v", err)
 		// Wait before retrying and check for context cancellation to avoid tight loop on errors
 		select {
 		case <-time.After(5 * time.Second):
@@ -339,7 +339,7 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 
 	if len(claims) == 1 {
 		if err = b.processMessage(ctx, claims[0]); err != nil {
-			b.Error(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
+			b.Errorf(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
 		}
 		return
 	}
@@ -352,7 +352,7 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		Count:    1,
 	})
 	if err != nil {
-		b.Error(ctx, "Failed to read from stream %s: %v", b.stream, err)
+		b.Errorf(ctx, "Failed to read from stream %s: %v", b.stream, err)
 		return
 	}
 
@@ -366,7 +366,7 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 
 	err = b.processMessage(ctx, messages[0].Messages[0])
 	if err != nil {
-		b.Error(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
+		b.Errorf(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
 	}
 }
 
@@ -386,7 +386,7 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	receiverName, ok := msg.Values["receiver"].(string)
 	if !ok {
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
-		b.Error(ctx, "Message %q does not contain a valid receiver name", msg.ID)
+		b.Errorf(ctx, "Message %q does not contain a valid receiver name", msg.ID)
 		return ErrorInvalidReceiverName
 	}
 
@@ -395,12 +395,13 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	b.mu.RUnlock()
 	if !ok {
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
+		b.Errorf(ctx, "Receiver %q is not registered", receiverName)
 		return ErrorReceiverNotRegistered
 	}
 
 	retry := b.GetRetry(ctx, msg.ID)
 	if retry >= int(b.numRetries) {
-		b.Warn(ctx, "Message %q exceeded retry limit (%d), discarding", msg.ID, b.numRetries)
+		b.Warnf(ctx, "Message %q exceeded retry limit (%d), discarding", msg.ID, b.numRetries)
 		b.DelRetry(ctx, msg.ID)
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 		return nil
@@ -415,13 +416,13 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	ctx, err = receiver.Start(ctx, msg.Values)
 	if err != nil {
 		b.inFlight.Add(-1)
-		b.Error(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
+		b.Errorf(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
 		return err
 	}
 
 	err = receiver.Execute(ctx)
 	if err != nil {
-		b.Error(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
+		b.Errorf(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
 		receiver.Finish(ctx)
 		b.inFlight.Add(-1)
 		return err
@@ -450,7 +451,7 @@ func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
 	// Set the retry count in Redis with a TTL in a seconds. Time multiplied by 3 to ensure that all retries have enough time to be attempted before the retry count expires.
 	err := b.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), strconv.Itoa(num), int(b.numRetries*b.retryIdleTime*3))
 	if err != nil {
-		b.Error(ctx, "Failed to set retry count for key %q: %v", key, err)
+		b.Errorf(ctx, "Failed to set retry count for key %q: %v", key, err)
 	}
 }
 
@@ -469,7 +470,7 @@ func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
 func (b *Bus) GetRetry(ctx context.Context, key string) int {
 	val, err := b.redis.Get(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), "0")
 	if err != nil {
-		b.Error(ctx, "Failed to get retry count for key %q: %v", key, err)
+		b.Errorf(ctx, "Failed to get retry count for key %q: %v", key, err)
 		return retryFailed
 	}
 
@@ -492,7 +493,7 @@ func (b *Bus) GetRetry(ctx context.Context, key string) int {
 func (b *Bus) DelRetry(ctx context.Context, key string) {
 	err := b.redis.Del(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key))
 	if err != nil {
-		b.Error(ctx, "Failed to delete retry count for key %q: %v", key, err)
+		b.Errorf(ctx, "Failed to delete retry count for key %q: %v", key, err)
 	}
 }
 
