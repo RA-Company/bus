@@ -30,8 +30,8 @@ type ReceiverInterface interface {
 type ReceiverFactory func() ReceiverInterface
 
 type Receiver struct {
-	Self         TitleInterface // Self is an optional struct that implements TitleInterface to provide a custom title for logging.
-	Payload      any            // Payload holds a pointer to a typed struct that is populated by PreloadVariables via json.Unmarshal.
+	Self    TitleInterface // Self is an optional struct that implements TitleInterface to provide a custom title for logging.
+	Payload any            // Payload holds a pointer to a typed struct that is populated by PreloadVariables via json.Unmarshal.
 	// Initialize it to a zero-value pointer of the expected type before the receiver is used, e.g.:
 	//   r.Payload = &MyPayload{}
 	// json.Unmarshal into &r.Payload dereferences the *any and fills the pointed-to struct in place.
@@ -176,6 +176,11 @@ func (r *Receiver) InFlight() string {
 		return fmt.Sprintf("[?/%d]", r.workersCount)
 	}
 	return fmt.Sprintf("[%d/%d]", r.inFlight.Load(), r.workersCount)
+}
+
+// Method should be redefined for custom title in a child
+func (r *Receiver) Title() string {
+	return ""
 }
 
 func (r *Receiver) title() string {
