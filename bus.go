@@ -35,26 +35,28 @@ const retryFailed = math.MaxInt // A large number to indicate that a message sho
 
 type Bus struct {
 	logging.CustomLogger
-	redis         *redis.RedisClient
-	stream        string                     // Stream name for the bus
-	group         string                     // Consumer group name
-	workersCount  int64                      // Number of workers to process tasks (default: 10)
-	numRetries    int64                      // Number of retries for failed tasks (default: 5)
-	streamSize    int64                      // Maximum size of the stream (default: 10000)
-	retryIdleTime int64                      // Minimum idle time in seconds before retrying a message (default: 60 seconds)
-	receivers     map[string]ReceiverFactory // Map of receivers by name
-	mu            sync.RWMutex               // Mutex to protect access to the receivers map
-	inFlight      atomic.Int64               // Counter for the number of messages currently being processed
+	redis            *redis.RedisClient
+	stream           string                     // Stream name for the bus
+	group            string                     // Consumer group name
+	workersCount     int64                      // Number of workers to process tasks (default: 10)
+	numRetries       int64                      // Number of retries for failed tasks (default: 5)
+	streamSize       int64                      // Maximum size of the stream (default: 10000)
+	retryIdleTime    int64                      // Minimum idle time in seconds before retrying a message (default: 60 seconds)
+	receivers        map[string]ReceiverFactory // Map of receivers by name
+	mu               sync.RWMutex               // Mutex to protect access to the receivers map
+	inFlight         atomic.Int64               // Counter for the number of messages currently being processed
+	showUnregistered bool                       // Whether to show warnings for unregistered receivers
 }
 
 type BusConfiguration struct {
-	Redis         redis.Config // Configuration for Redis connection
-	Stream        string       // Stream name for the bus
-	Group         string       // Consumer group name
-	WorkersCount  int64        // Number of workers to process tasks
-	NumRetries    int64        // Number of retries for failed tasks
-	StreamSize    int64        // Maximum size of the stream
-	RetryIdleTime int64        // Minimum idle time before retrying a message (in seconds)
+	Redis            redis.Config // Configuration for Redis connection
+	Stream           string       // Stream name for the bus
+	Group            string       // Consumer group name
+	WorkersCount     int64        // Number of workers to process tasks
+	NumRetries       int64        // Number of retries for failed tasks
+	StreamSize       int64        // Maximum size of the stream
+	RetryIdleTime    int64        // Minimum idle time before retrying a message (in seconds)
+	ShowUnregistered bool         // Whether to show warnings for unregistered receivers
 }
 
 // SetLogger allows setting a custom logger for the bus.
@@ -80,6 +82,7 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 	b.receivers = make(map[string]ReceiverFactory)
 	b.redis = &redis.RedisClient{}
 	b.redis.Start(ctx, &config.Redis)
+	b.showUnregistered = config.ShowUnregistered
 
 	b.stream = config.Stream
 	if b.stream == "" {
@@ -364,9 +367,10 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		return
 	}
 
-	err = b.processMessage(ctx, messages[0].Messages[0])
-	if err != nil {
-		b.Errorf(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
+	if err = b.processMessage(ctx, messages[0].Messages[0]); err != nil {
+		if !errors.Is(err, ErrorReceiverNotRegistered) {
+			b.Errorf(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
+		}
 	}
 }
 
@@ -395,7 +399,9 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	b.mu.RUnlock()
 	if !ok {
 		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
-		b.Errorf(ctx, "Receiver %q is not registered", receiverName)
+		if b.showUnregistered {
+			b.Warnf(ctx, "Receiver %q is not registered", receiverName)
+		}
 		return ErrorReceiverNotRegistered
 	}
 
