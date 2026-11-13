@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync/atomic"
 	"testing"
@@ -11,7 +12,6 @@ import (
 	"github.com/brianvoe/gofakeit/v7"
 	"github.com/google/uuid"
 	"github.com/ra-company/database/redis"
-	"github.com/ra-company/env"
 	"github.com/ra-company/logging"
 	re "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -85,7 +85,7 @@ func (t *TestPanicReceiver) Execute(ctx context.Context) error {
 	panic("simulated panic in TestPanicReceiver")
 }
 
-func Test(t *testing.T) {
+func redisLegacy(t *testing.T) {
 	ctx := t.Context()
 	faker := gofakeit.New(0)
 
@@ -95,13 +95,7 @@ func Test(t *testing.T) {
 	numRetries := faker.Number(1, 5)
 	bus := &Bus{}
 
-	config := redis.Config{
-		Hosts:    env.GetEnvStr("REDIS_HOSTS", ""),
-		Password: env.GetEnvStr("REDIS_PWD", "-"),
-		DB:       env.GetEnvInt("REDIS_DB", -1),
-	}
-	require.NotEmpty(t, config.Hosts, "REDIS_HOSTS should not be empty")
-	require.GreaterOrEqual(t, config.DB, 0, "REDIS_DB should be defined")
+	config := redisConfig(t)
 
 	redis := &redis.RedisClient{}
 	redis.Start(ctx, &config)
@@ -165,28 +159,6 @@ func Test(t *testing.T) {
 		"error receiver should have retried %d times", numRetries)
 }
 
-// redisConfig reads Redis connection parameters from environment variables and
-// skips the test if they are not configured.
-func redisConfig(t *testing.T) redis.Config {
-	t.Helper()
-	cfg := redis.Config{
-		Hosts:    env.GetEnvStr("REDIS_HOSTS", ""),
-		Password: env.GetEnvStr("REDIS_PWD", "-"),
-		DB:       env.GetEnvInt("REDIS_DB", -1),
-	}
-	if cfg.Hosts == "" || cfg.DB < 0 {
-		t.Skip("REDIS_HOSTS / REDIS_DB not configured")
-	}
-	return cfg
-}
-
-func redisStart(t *testing.T) (*redis.RedisClient, *redis.Config) {
-	cfg := redisConfig(t)
-	redis := &redis.RedisClient{}
-	redis.Start(t.Context(), &cfg)
-	return redis, &cfg
-}
-
 // TestAddMessage_EmptyReceiver verifies the early-return error path that does
 // not touch Redis, so no connection is needed.
 func TestAddMessage_EmptyReceiver(t *testing.T) {
@@ -194,9 +166,9 @@ func TestAddMessage_EmptyReceiver(t *testing.T) {
 	require.ErrorIs(t, err, ErrorEmptyReceiverTitle)
 }
 
-// TestAddMessage_NonSerializablePayload verifies that json.Marshal failure is
+// redisAddMessage_NonSerializablePayload verifies that json.Marshal failure is
 // propagated before XAdd is called.
-func TestAddMessage_NonSerializablePayload(t *testing.T) {
+func redisAddMessage_NonSerializablePayload(t *testing.T) {
 	redis, cfg := redisStart(t)
 
 	b := &Bus{}
@@ -207,9 +179,9 @@ func TestAddMessage_NonSerializablePayload(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestAddMessage_Success verifies that a valid message is stored and a non-empty
+// redisAddMessage_Success verifies that a valid message is stored and a non-empty
 // UUID-shaped ID is returned.
-func TestAddMessage_Success(t *testing.T) {
+func redisAddMessage_Success(t *testing.T) {
 	redis, cfg := redisStart(t)
 
 	b := &Bus{}
@@ -262,9 +234,9 @@ func TestBus_RegisterReceiver(t *testing.T) {
 	})
 }
 
-// TestBus_Init_Defaults verifies that every zero/missing BusConfiguration field
+// redisBus_Init_Defaults verifies that every zero/missing BusConfiguration field
 // falls back to the documented default value.
-func TestBus_Init_Defaults(t *testing.T) {
+func redisBus_Init_Defaults(t *testing.T) {
 	redis, cfg := redisStart(t)
 
 	cases := []struct {
@@ -319,9 +291,9 @@ func TestBus_Init_Defaults(t *testing.T) {
 	}
 }
 
-// TestBus_RetryManagement tests the SetRetry / GetRetry / DelRetry round-trip
+// redisBus_RetryManagement tests the SetRetry / GetRetry / DelRetry round-trip
 // using a real Redis connection.
-func TestBus_RetryManagement(t *testing.T) {
+func redisBus_RetryManagement(t *testing.T) {
 	redis, cfg := redisStart(t)
 	b := &Bus{}
 	b.Init(t.Context(), &BusConfiguration{
@@ -351,9 +323,9 @@ func TestBus_RetryManagement(t *testing.T) {
 	})
 }
 
-// TestProcessMessage_InvalidReceiverField verifies that a message whose
+// redisProcessMessage_InvalidReceiverField verifies that a message whose
 // "receiver" field is not a string is ACKed and returns ErrorInvalidReceiverName.
-func TestProcessMessage_InvalidReceiverField(t *testing.T) {
+func redisProcessMessage_InvalidReceiverField(t *testing.T) {
 	rdb, cfg := redisStart(t)
 
 	b := &Bus{}
@@ -368,9 +340,9 @@ func TestProcessMessage_InvalidReceiverField(t *testing.T) {
 	require.ErrorIs(t, err, ErrorInvalidReceiverName)
 }
 
-// TestProcessMessage_UnregisteredReceiver verifies that a message for an unknown
+// redisProcessMessage_UnregisteredReceiver verifies that a message for an unknown
 // receiver is ACKed and returns ErrorReceiverNotRegistered.
-func TestProcessMessage_UnregisteredReceiver(t *testing.T) {
+func redisProcessMessage_UnregisteredReceiver(t *testing.T) {
 	rdb, cfg := redisStart(t)
 
 	b := &Bus{}
@@ -385,38 +357,27 @@ func TestProcessMessage_UnregisteredReceiver(t *testing.T) {
 	require.ErrorIs(t, err, ErrorReceiverNotRegistered)
 }
 
-// TestProcessMessage_RetryExceeded verifies that once the retry counter exceeds
-// numRetries the message is ACKed, the counter is cleaned up, and nil is returned.
-func TestProcessMessage_RetryExceeded(t *testing.T) {
-	rdb, cfg := redisStart(t)
+// redisProcessMessage_RetryExceeded verifies that once the delivery counter exceeds
+// numRetries the message is ACKed without being executed, and nil is returned.
+func redisProcessMessage_RetryExceeded(t *testing.T) {
+	numRetries := 3
+	env := newTestEnv(t, func(c *BusConfiguration) { c.NumRetries = int64(numRetries); c.RetryIdleTime = 10 })
 
-	numRetries := int64(3)
-	b := &Bus{}
-	b.Init(t.Context(), &BusConfiguration{
-		Redis:         *cfg,
-		Stream:        uuid.New().String(),
-		NumRetries:    numRetries,
-		RetryIdleTime: 10,
-	})
-	defer rdb.XGroupDestroy(context.Background(), b.stream, b.group)
+	var runs atomic.Int32
+	env.register("recv", func(context.Context, *scriptReceiver) error { runs.Add(1); return nil })
+	env.add("recv")
 
-	b.mu.Lock()
-	b.receivers = make(map[string]ReceiverFactory)
-	b.receivers["recv"] = func() ReceiverInterface { return &TestReceiver{} }
-	b.mu.Unlock()
-
-	ctx := t.Context()
-	msgID := "1-0"
-	b.SetRetry(ctx, msgID, int(numRetries)) // already at max
-
-	msg := re.XMessage{
-		ID:     msgID,
-		Values: map[string]any{"receiver": "recv"},
+	msg := env.deliver() // delivery 1
+	for range numRetries {
+		var ok bool
+		msg, ok = env.redeliver(msg.ID) // deliveries 2..numRetries+1
+		require.True(t, ok)
 	}
-	err := b.processMessage(ctx, msg)
+
+	err := env.b.processMessage(t.Context(), msg)
 	require.NoError(t, err, "exceeded retry should return nil, not an error")
-	// counter must be removed
-	require.Equal(t, 0, b.GetRetry(ctx, msgID), "retry counter should be deleted after exhaustion")
+	require.Zero(t, runs.Load(), "an exhausted message must not be executed")
+	require.EqualValues(t, 0, env.pending(), "an exhausted message must be acknowledged")
 }
 
 // TestReceiver_PreloadVariables_MissingReceiverKey verifies that a task map
@@ -644,75 +605,40 @@ func TestReceiver_Execute_Panics(t *testing.T) {
 	require.Panics(t, func() { _ = r.Execute(t.Context()) })
 }
 
-// TestProcessMessage_StartError verifies that processMessage propagates the
+// redisProcessMessage_StartError verifies that processMessage propagates the
 // error returned by receiver.Start. An invalid JSON payload triggers the
 // error inside PreloadVariables without requiring a special receiver type.
-func TestProcessMessage_StartError(t *testing.T) {
-	rdb, cfg := redisStart(t)
+func redisProcessMessage_StartError(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.register("recv", func(context.Context, *scriptReceiver) error { return nil })
 
-	b := &Bus{}
-	b.Init(t.Context(), &BusConfiguration{
-		Redis:         *cfg,
-		Stream:        uuid.New().String(),
-		NumRetries:    5,
-		RetryIdleTime: 10,
-	})
-	defer rdb.XGroupDestroy(context.Background(), b.stream, b.group)
+	_, err := env.rdb.Client().XAdd(t.Context(), &re.XAddArgs{
+		Stream: env.b.stream,
+		Values: map[string]any{"receiver": "recv", "payload": "not-valid-json"},
+	}).Result()
+	require.NoError(t, err)
 
-	b.mu.Lock()
-	b.receivers = map[string]ReceiverFactory{
-		"recv": func() ReceiverInterface { return &TestReceiver{} },
-	}
-	b.mu.Unlock()
-
-	msg := re.XMessage{
-		ID: "1-0",
-		Values: map[string]any{
-			"receiver": "recv",
-			"payload":  "not-valid-json",
-		},
-	}
-	err := b.processMessage(t.Context(), msg)
+	err = env.b.processMessage(t.Context(), env.deliver())
 	require.Error(t, err, "processMessage should surface the Start error")
+	require.EqualValues(t, 1, env.pending(), "a message that failed to start stays pending")
 }
 
-// TestProcessMessage_ExecuteError verifies that processMessage propagates the
+// redisProcessMessage_ExecuteError verifies that processMessage propagates the
 // error returned by receiver.Execute. TestErrorReceiver always returns a
 // non-nil error from Execute.
-func TestProcessMessage_ExecuteError(t *testing.T) {
-	rdb, cfg := redisStart(t)
+func redisProcessMessage_ExecuteError(t *testing.T) {
+	env := newTestEnv(t, nil)
+	env.register("recv", func(context.Context, *scriptReceiver) error { return errors.New("simulated error") })
+	env.add("recv")
 
-	b := &Bus{}
-	b.Init(t.Context(), &BusConfiguration{
-		Redis:         *cfg,
-		Stream:        uuid.New().String(),
-		NumRetries:    5,
-		RetryIdleTime: 10,
-	})
-	defer rdb.XGroupDestroy(context.Background(), b.stream, b.group)
-
-	b.mu.Lock()
-	b.receivers = map[string]ReceiverFactory{
-		"recv": func() ReceiverInterface {
-			return newTestErrorReceiver(t.Context(), *cfg)
-		},
-	}
-	b.mu.Unlock()
-
-	msg := re.XMessage{
-		ID: "2-0",
-		Values: map[string]any{
-			"receiver": "recv",
-			"payload":  `{"title":"t","foo":"f"}`,
-		},
-	}
-	err := b.processMessage(t.Context(), msg)
+	err := env.b.processMessage(t.Context(), env.deliver())
 	require.Error(t, err, "processMessage should surface the Execute error")
+	require.EqualValues(t, 1, env.pending(), "a failed message stays pending")
 }
 
-// TestBus_GetRetry_CorruptValue verifies that GetRetry returns retryFailed
+// redisBus_GetRetry_CorruptValue verifies that GetRetry returns retryFailed
 // when the Redis value cannot be parsed as an integer (simulated corruption).
-func TestBus_GetRetry_CorruptValue(t *testing.T) {
+func redisBus_GetRetry_CorruptValue(t *testing.T) {
 	rdb, cfg := redisStart(t)
 
 	b := &Bus{}

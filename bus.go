@@ -341,9 +341,7 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 	}
 
 	if len(claims) == 1 {
-		if err = b.processMessage(ctx, claims[0]); err != nil {
-			b.Errorf(ctx, "Failed to execute receiver %q: %v", claims[0].Values["receiver"], err)
-		}
+		b.logProcessError(ctx, claims[0], b.processMessage(ctx, claims[0]))
 		return
 	}
 
@@ -367,30 +365,45 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		return
 	}
 
-	if err = b.processMessage(ctx, messages[0].Messages[0]); err != nil {
-		if !errors.Is(err, ErrorReceiverNotRegistered) {
-			b.Errorf(ctx, "Failed to process message %q with id %q: %v", messages[0].Messages[0].Values["receiver"], messages[0].Messages[0].Values["id"], err)
-		}
+	b.logProcessError(ctx, messages[0].Messages[0], b.processMessage(ctx, messages[0].Messages[0]))
+}
+
+// logProcessError logs a processMessage failure. Messages for unregistered receivers are
+// acknowledged and ignored by design, so they are not reported as errors.
+func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
+	if err == nil || errors.Is(err, ErrorReceiverNotRegistered) {
+		return
 	}
+	b.Errorf(ctx, "Failed to process message %q (stream id %q, message id %q): %v", msg.Values["receiver"], msg.ID, msg.Values["id"], err)
 }
 
 // processMessage processes a message by starting the associated receiver, executing it, and finishing it.
 // It retrieves the receiver name from the message, checks if the receiver is registered,
 // and if so, it starts the receiver, executes it, and finishes it.
-// If the receiver fails to start or execute, it retries the receiver based on the retry logic.
-// After processing the receiver, it acknowledges the message in the Redis stream.
+//
+// Delivery is "at least once": the message is acknowledged only after the receiver has succeeded.
+// If the receiver fails (or panics), the message stays pending in the consumer group and is
+// redelivered by XAUTOCLAIM after RetryIdleTime. The number of attempts is the delivery counter
+// Redis keeps for every pending entry (XPENDING), so it is atomic, survives restarts of the
+// workers and disappears together with the entry on XACK. A message that has been delivered more
+// than NumRetries times is acknowledged without being executed.
+//
+// If the delivery counter cannot be read (for example Redis is briefly unavailable), the message is
+// neither executed nor acknowledged: an error is returned and the message stays pending, so it is
+// redelivered later instead of being lost.
 //
 // Parameters:
 //   - ctx: The context for the operation.
 //   - msg: The message containing the receiver data, which should include the receiver title and other necessary information.
 //
 // Returns:
-//   - error: An error if the receiver fails to start or execute, otherwise nil.
+//   - error: An error if the receiver fails to start or execute, or if the message could not be
+//     acknowledged or its delivery counter could not be read, otherwise nil.
 func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	receiverName, ok := msg.Values["receiver"].(string)
 	if !ok {
-		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 		b.Errorf(ctx, "Message %q does not contain a valid receiver name", msg.ID)
+		_ = b.ack(ctx, msg.ID) // failure is logged inside
 		return ErrorInvalidReceiverName
 	}
 
@@ -398,24 +411,28 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	factory, ok := b.receivers[receiverName]
 	b.mu.RUnlock()
 	if !ok {
-		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
 		if b.showUnregistered {
 			b.Warnf(ctx, "Receiver %q is not registered", receiverName)
 		}
+		_ = b.ack(ctx, msg.ID) // failure is logged inside
 		return ErrorReceiverNotRegistered
 	}
 
-	retry := b.GetRetry(ctx, msg.ID)
-	if retry >= int(b.numRetries) {
-		b.Warnf(ctx, "Message %q exceeded retry limit (%d), discarding", msg.ID, b.numRetries)
-		b.DelRetry(ctx, msg.ID)
-		b.redis.XAck(ctx, b.stream, b.group, msg.ID)
+	deliveries, pending, err := b.deliveryCount(ctx, msg.ID)
+	if err != nil {
+		b.Errorf(ctx, "Failed to read delivery count of message %q, leaving it pending for redelivery: %v", msg.ID, err)
+		return fmt.Errorf("read delivery count of message %s: %w", msg.ID, err)
+	}
+	if !pending {
+		// Somebody else has already acknowledged (or the stream has trimmed) this message.
+		b.Warnf(ctx, "Message %q is no longer pending, skipping", msg.ID)
 		return nil
 	}
-	retry++
-	b.SetRetry(ctx, msg.ID, retry)
+	if deliveries > b.numRetries {
+		b.Warnf(ctx, "Message %q exceeded retry limit (%d deliveries, limit %d), discarding", msg.ID, deliveries, b.numRetries)
+		return b.ack(ctx, msg.ID)
+	}
 
-	var err error
 	receiver := factory()
 	b.inFlight.Add(1)
 	receiver.SetBusContext(&b.inFlight, b.workersCount)
@@ -436,13 +453,56 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	receiver.Finish(ctx)
 	b.inFlight.Add(-1)
 
-	b.redis.XAck(ctx, b.stream, b.group, msg.ID)
-	b.DelRetry(ctx, msg.ID)
+	return b.ack(ctx, msg.ID)
+}
 
+// ackTimeout limits how long an acknowledgement may take.
+const ackTimeout = 5 * time.Second
+
+// ack acknowledges a message in the consumer group. A failure is logged together with the message
+// id and returned: the message then stays pending and will be redelivered.
+// The acknowledgement deliberately ignores cancellation of ctx (bus shutdown), otherwise a receiver
+// that has just finished successfully would be executed again after the restart.
+func (b *Bus) ack(ctx context.Context, id string) error {
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
+	defer cancel()
+
+	if _, err := b.redis.XAck(ackCtx, b.stream, b.group, id); err != nil {
+		b.Errorf(ctx, "Failed to acknowledge message %q (stream %q, group %q), it stays pending and will be redelivered: %v", id, b.stream, b.group, err)
+		return fmt.Errorf("acknowledge message %s: %w", id, err)
+	}
 	return nil
 }
 
+// deliveryCount returns how many times Redis has delivered the pending entry id to the group
+// (XREADGROUP counts the first delivery, every XCLAIM/XAUTOCLAIM adds one), including the current one.
+// pending is false when the entry is not in the pending list any more.
+// An error means that the counter could not be read, which is different from an exhausted limit.
+func (b *Bus) deliveryCount(ctx context.Context, id string) (deliveries int64, pending bool, err error) {
+	res, err := b.redis.Client().XPendingExt(ctx, &re.XPendingExtArgs{
+		Stream: b.stream,
+		Group:  b.group,
+		Start:  id,
+		End:    id,
+		Count:  1,
+	}).Result()
+	if err != nil {
+		if errors.Is(err, re.Nil) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if len(res) == 0 || res[0].ID != id {
+		return 0, false, nil
+	}
+	return res[0].RetryCount, true, nil
+}
+
 // SetRetry sets the retry count for a specific message key in Redis.
+//
+// Deprecated: the bus no longer uses this counter. The number of attempts is taken from the delivery
+// counter Redis keeps for every pending stream entry. The method is kept for compatibility and only
+// touches the legacy key "<stream>:retry:<key>".
 // It constructs a Redis key using the stream name and the provided key,
 // and sets the retry count as the value.
 // If setting the retry count fails, it logs an error.
@@ -462,6 +522,11 @@ func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
 }
 
 // GetRetry retrieves the retry count for a specific message key from Redis.
+//
+// Deprecated: the bus no longer uses this counter. The number of attempts is taken from the delivery
+// counter Redis keeps for every pending stream entry. The method is kept for compatibility and only
+// reads the legacy key "<stream>:retry:<key>". Note that it cannot tell a Redis error from an
+// exhausted limit: both are reported as retryFailed.
 // It constructs a Redis key using the stream name and the provided key,
 // and retrieves the retry count value.
 // If retrieving the retry count fails, it logs an error and returns retryFailed for end retrying.
@@ -489,6 +554,8 @@ func (b *Bus) GetRetry(ctx context.Context, key string) int {
 }
 
 // DelRetry deletes the retry count for a specific message key from Redis.
+//
+// Deprecated: the bus no longer uses this counter; see SetRetry. Kept for compatibility.
 // It constructs a Redis key using the stream name and the provided key,
 // and deletes the corresponding entry from Redis.
 // If deleting the retry count fails, it logs an error.

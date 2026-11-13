@@ -126,8 +126,14 @@ func (r *Receiver) PreloadVariables(ctx context.Context, task map[string]any) (c
 		}
 	}
 
+	// Bus.AddMessage stores the creation time in the "time" field. The legacy "event" field
+	// is accepted as a fallback for messages produced by other writers.
 	var err error
-	if val, ok := task["event"]; ok {
+	val, ok := task["time"]
+	if !ok {
+		val, ok = task["event"]
+	}
+	if ok {
 		if r.event, err = time.Parse(time.RFC3339Nano, getString(val)); err != nil {
 			logging.Logs.Errorf(ctx, "%s->Failed to parse event time: %v", Caller(), err)
 			r.event = time.Now().UTC()
