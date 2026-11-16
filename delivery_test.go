@@ -181,6 +181,7 @@ func newTestEnv(t *testing.T, mutate func(*BusConfiguration)) *testEnv {
 		ctx := context.Background()
 		_ = rdb.XGroupDestroy(ctx, b.stream, b.group)
 		_ = rdb.Del(ctx, b.stream)
+		_ = rdb.Del(ctx, b.deadStream)
 		if keys, err := scanAll(ctx, rdb.Client(), b.stream+":retry:*"); err == nil {
 			for _, k := range keys {
 				_ = rdb.Del(ctx, k)

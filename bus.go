@@ -29,6 +29,7 @@ var (
 	ErrorReceiverNotRegistered = fmt.Errorf("receiver not registered")
 	ErrorInvalidReceiverName   = fmt.Errorf("invalid receiver name")
 	ErrorEmptyTask             = fmt.Errorf("task cannot be empty")
+	ErrorEmptyGroupName        = fmt.Errorf("group name cannot be empty")
 )
 
 const retryFailed = math.MaxInt // A large number to indicate that a message should not be retried anymore
@@ -46,6 +47,12 @@ type Bus struct {
 	mu               sync.RWMutex               // Mutex to protect access to the receivers map
 	inFlight         atomic.Int64               // Counter for the number of messages currently being processed
 	showUnregistered bool                       // Whether to show warnings for unregistered receivers
+	options          map[string]ReceiverOptions // Per-receiver options by name (guarded by mu)
+	deadStream       string                     // Dead-letter stream name (default: <stream>:dead)
+	deadSize         int64                      // Maximum number of entries in the dead-letter stream (default: 10000)
+	deadRetention    time.Duration              // How long dead-letter entries are kept (default: 30 days)
+	counters         counters                   // In-process counters, see Stats
+	hook             atomic.Pointer[hookBox]    // Optional metrics hook, see SetMetricsHook
 }
 
 type BusConfiguration struct {
@@ -57,6 +64,23 @@ type BusConfiguration struct {
 	StreamSize       int64        // Maximum size of the stream
 	RetryIdleTime    int64        // Minimum idle time before retrying a message (in seconds)
 	ShowUnregistered bool         // Whether to show warnings for unregistered receivers
+
+	// DeadLetterStream is the stream that receives messages the bus gave up on (retries exhausted
+	// or a receiver returned Permanent). Default: "<Stream>:dead".
+	DeadLetterStream string
+	// DeadLetterSize is the maximum number of entries kept in the dead-letter stream. Default: 10000.
+	DeadLetterSize int64
+	// DeadLetterRetention is how long entries stay in the dead-letter stream, any positive duration
+	// (for example 10*24*time.Hour). Entries older than that are trimmed when a new one is written.
+	// Default: 30 days.
+	DeadLetterRetention time.Duration
+}
+
+// ReceiverOptions are optional per-receiver settings, see RegisterReceiverWithOptions.
+type ReceiverOptions struct {
+	// NumRetries is the maximum number of executions of one message by this receiver. Zero or a
+	// negative value means the group-wide BusConfiguration.NumRetries.
+	NumRetries int64
 }
 
 // SetLogger allows setting a custom logger for the bus.
@@ -80,6 +104,7 @@ func (b *Bus) SetLogger(logger logging.Logger) {
 //   - config: The configuration for the bus, including Redis connection details, stream name, group name, workers count, and number of retries.
 func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 	b.receivers = make(map[string]ReceiverFactory)
+	b.options = make(map[string]ReceiverOptions)
 	b.redis = &redis.RedisClient{}
 	b.redis.Start(ctx, &config.Redis)
 	b.showUnregistered = config.ShowUnregistered
@@ -118,6 +143,19 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 		b.retryIdleTime = 60 // Default to 60 seconds (1 minute) if not provided or invalid
 	}
 
+	b.deadStream = config.DeadLetterStream
+	if b.deadStream == "" {
+		b.deadStream = b.stream + ":dead"
+	}
+	b.deadSize = config.DeadLetterSize
+	if b.deadSize <= 0 {
+		b.deadSize = defaultDeadLetterSize
+	}
+	b.deadRetention = config.DeadLetterRetention
+	if b.deadRetention <= 0 {
+		b.deadRetention = defaultDeadLetterRetention
+	}
+
 	err := b.redis.XGroupCreateMkStream(ctx, b.stream, b.group, "$")
 	if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
 		b.Errorf(ctx, "Failed to create group %s for stream %s: %v", b.group, b.stream, err)
@@ -140,6 +178,13 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 //   - title: The title of the receiver to register.
 //   - receiver: The ReceiverInterface implementation that defines the receiver's behavior.
 func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver ReceiverFactory) {
+	b.RegisterReceiverWithOptions(ctx, title, receiver, ReceiverOptions{})
+}
+
+// RegisterReceiverWithOptions registers a receiver like RegisterReceiver and applies per-receiver
+// options, for example its own limit of executions (ReceiverOptions.NumRetries) instead of the
+// group-wide one. Registering the same title again replaces both the factory and the options.
+func (b *Bus) RegisterReceiverWithOptions(ctx context.Context, title string, receiver ReceiverFactory, opts ReceiverOptions) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -151,13 +196,45 @@ func (b *Bus) RegisterReceiver(ctx context.Context, title string, receiver Recei
 	if b.receivers == nil {
 		b.receivers = make(map[string]ReceiverFactory)
 	}
+	if b.options == nil {
+		b.options = make(map[string]ReceiverOptions)
+	}
 
 	if _, exists := b.receivers[title]; exists {
 		b.Warnf(ctx, "Receiver %q is already registered, overwriting it", title)
 	}
 
 	b.receivers[title] = receiver
+	b.options[title] = opts
 	b.Infof(ctx, "Receiver %q registered successfully", title)
+}
+
+// Subscribe declares that this service handles messages for the receiver title. It is a synonym
+// of RegisterReceiver that reads better in services which are consumers of events.
+//
+// Messages for receivers the service has not subscribed to are not an error: the bus
+// acknowledges and ignores them, because a consumer group sees the whole stream.
+func (b *Bus) Subscribe(ctx context.Context, title string, receiver ReceiverFactory) {
+	b.RegisterReceiver(ctx, title, receiver)
+}
+
+// EnsureGroups creates the given consumer groups on the stream if they do not exist yet, creating
+// the stream too. A group is created at position "0", so it receives every message that is in the
+// stream, including messages a producer added before the consuming service started for the first
+// time. Existing groups are left untouched. Call it on the producing side for every service that
+// must not miss events; Init creates only the bus' own group, at the end of the stream ("$").
+func (b *Bus) EnsureGroups(ctx context.Context, groups ...string) error {
+	for _, group := range groups {
+		if group == "" {
+			return ErrorEmptyGroupName
+		}
+		err := b.redis.XGroupCreateMkStream(ctx, b.stream, group, "0")
+		if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
+			b.Errorf(ctx, "Failed to ensure group %s for stream %s: %v", group, b.stream, err)
+			return fmt.Errorf("ensure group %q: %w", group, err)
+		}
+	}
+	return nil
 }
 
 // GetReceiver retrieves a registered receiver by its title.
@@ -299,7 +376,6 @@ func (b *Bus) safeWorker(ctx context.Context) {
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						b.inFlight.Add(-1) // Decrement in-flight counter if a panic occurs
 						b.Errorf(ctx, "[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
 					}
 				}()
@@ -386,11 +462,14 @@ func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
 // redelivered by XAUTOCLAIM after RetryIdleTime. The number of attempts is the delivery counter
 // Redis keeps for every pending entry (XPENDING), so it is atomic, survives restarts of the
 // workers and disappears together with the entry on XACK. A message that has been delivered more
-// than NumRetries times is acknowledged without being executed.
+// than the allowed number of times (ReceiverOptions.NumRetries of the receiver, else NumRetries of
+// the bus) is moved to the dead-letter stream and acknowledged without being executed again.
+// A receiver that returns an error marked with Permanent is not retried either: its message goes
+// to the dead-letter stream at once.
 //
 // If the delivery counter cannot be read (for example Redis is briefly unavailable), the message is
 // neither executed nor acknowledged: an error is returned and the message stays pending, so it is
-// redelivered later instead of being lost.
+// redelivered later instead of being lost. The same holds when the dead-letter write fails.
 //
 // Parameters:
 //   - ctx: The context for the operation.
@@ -398,23 +477,26 @@ func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
 //
 // Returns:
 //   - error: An error if the receiver fails to start or execute, or if the message could not be
-//     acknowledged or its delivery counter could not be read, otherwise nil.
+//     acknowledged, moved to the dead-letter stream or its delivery counter could not be read, otherwise nil.
 func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	receiverName, ok := msg.Values["receiver"].(string)
 	if !ok {
 		b.Errorf(ctx, "Message %q does not contain a valid receiver name", msg.ID)
-		_ = b.ack(ctx, msg.ID) // failure is logged inside
+		_ = b.ack(ctx, msg) // failure is logged inside
 		return ErrorInvalidReceiverName
 	}
 
 	b.mu.RLock()
 	factory, ok := b.receivers[receiverName]
+	opts := b.options[receiverName]
 	b.mu.RUnlock()
 	if !ok {
+		// A consumer group sees the whole stream, so events this service has not subscribed to
+		// are normal: they are acknowledged and ignored.
 		if b.showUnregistered {
 			b.Warnf(ctx, "Receiver %q is not registered", receiverName)
 		}
-		_ = b.ack(ctx, msg.ID) // failure is logged inside
+		_ = b.ack(ctx, msg) // failure is logged inside
 		return ErrorReceiverNotRegistered
 	}
 
@@ -428,17 +510,61 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 		b.Warnf(ctx, "Message %q is no longer pending, skipping", msg.ID)
 		return nil
 	}
-	if deliveries > b.numRetries {
-		b.Warnf(ctx, "Message %q exceeded retry limit (%d deliveries, limit %d), discarding", msg.ID, deliveries, b.numRetries)
-		return b.ack(ctx, msg.ID)
+
+	limit := b.numRetries
+	if opts.NumRetries > 0 {
+		limit = opts.NumRetries
+	}
+	if deliveries > limit {
+		b.Warnf(ctx, "Message %q exceeded retry limit (%d deliveries, limit %d), moving it to the dead-letter stream", msg.ID, deliveries, limit)
+		return b.discard(ctx, msg, DeadReasonRetriesExhausted,
+			fmt.Sprintf("retry limit exceeded: delivered %d times, limit %d", deliveries, limit), deliveries)
+	}
+	if deliveries > 1 {
+		b.counters.retried.Add(1)
+		b.emit(ctx, func(h MetricsHook) { h.Retried(receiverName) })
 	}
 
-	receiver := factory()
+	started := time.Now()
+	if err = b.execute(ctx, factory(), msg); err != nil {
+		took := time.Since(started)
+		b.counters.failed.Add(1)
+		b.emit(ctx, func(h MetricsHook) { h.Failed(receiverName, took) })
+
+		if IsPermanent(err) {
+			b.Errorf(ctx, "Receiver %q failed permanently, message %q is not retried: %v", receiverName, msg.ID, err)
+			if derr := b.discard(ctx, msg, DeadReasonPermanent, err.Error(), deliveries); derr != nil {
+				return errors.Join(err, derr)
+			}
+		}
+		return err
+	}
+	took := time.Since(started)
+
+	if err = b.ack(ctx, msg); err != nil {
+		return err
+	}
+	b.counters.processed.Add(1)
+	b.emit(ctx, func(h MetricsHook) { h.Processed(receiverName, took) })
+
+	return nil
+}
+
+// execute starts the receiver, runs it and finishes it. A panic inside the receiver is recovered
+// and returned as an error, so the message stays pending and is retried like after any failure.
+func (b *Bus) execute(ctx context.Context, receiver ReceiverInterface, msg re.XMessage) (err error) {
 	b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
+	defer func() {
+		if r := recover(); r != nil {
+			b.Errorf(ctx, "Receiver %q panic recovered: %v \033[1m \033[31m%s\033[0m", msg.Values["receiver"], r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
+			err = fmt.Errorf("receiver %v panicked: %v", msg.Values["receiver"], r)
+		}
+	}()
+
 	receiver.SetBusContext(&b.inFlight, b.workersCount)
 	ctx, err = receiver.Start(ctx, msg.Values)
 	if err != nil {
-		b.inFlight.Add(-1)
 		b.Errorf(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
 		return err
 	}
@@ -447,29 +573,29 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	if err != nil {
 		b.Errorf(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
 		receiver.Finish(ctx)
-		b.inFlight.Add(-1)
 		return err
 	}
 	receiver.Finish(ctx)
-	b.inFlight.Add(-1)
-
-	return b.ack(ctx, msg.ID)
+	return nil
 }
 
-// ackTimeout limits how long an acknowledgement may take.
+// ackTimeout limits how long an acknowledgement or a dead-letter write may take.
 const ackTimeout = 5 * time.Second
 
 // ack acknowledges a message in the consumer group. A failure is logged together with the message
-// id and returned: the message then stays pending and will be redelivered.
+// id, counted and returned: the message then stays pending and will be redelivered.
 // The acknowledgement deliberately ignores cancellation of ctx (bus shutdown), otherwise a receiver
 // that has just finished successfully would be executed again after the restart.
-func (b *Bus) ack(ctx context.Context, id string) error {
+func (b *Bus) ack(ctx context.Context, msg re.XMessage) error {
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 
-	if _, err := b.redis.XAck(ackCtx, b.stream, b.group, id); err != nil {
-		b.Errorf(ctx, "Failed to acknowledge message %q (stream %q, group %q), it stays pending and will be redelivered: %v", id, b.stream, b.group, err)
-		return fmt.Errorf("acknowledge message %s: %w", id, err)
+	if _, err := b.redis.XAck(ackCtx, b.stream, b.group, msg.ID); err != nil {
+		b.Errorf(ctx, "Failed to acknowledge message %q (stream %q, group %q), it stays pending and will be redelivered: %v", msg.ID, b.stream, b.group, err)
+		b.counters.ackErrors.Add(1)
+		receiver, _ := msg.Values["receiver"].(string)
+		b.emit(ctx, func(h MetricsHook) { h.AckError(receiver) })
+		return fmt.Errorf("acknowledge message %s: %w", msg.ID, err)
 	}
 	return nil
 }
