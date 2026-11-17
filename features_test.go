@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -51,50 +50,6 @@ func alwaysFails(runs *atomic.Int32) func(context.Context, *scriptReceiver) erro
 		return errors.New("permanent failure")
 	}
 }
-
-// recordingHook records every MetricsHook call.
-type recordingHook struct {
-	mu     sync.Mutex
-	events []string
-}
-
-func (h *recordingHook) add(ev string) {
-	h.mu.Lock()
-	h.events = append(h.events, ev)
-	h.mu.Unlock()
-}
-
-func (h *recordingHook) count(prefix string) int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	n := 0
-	for _, ev := range h.events {
-		if len(ev) >= len(prefix) && ev[:len(prefix)] == prefix {
-			n++
-		}
-	}
-	return n
-}
-
-func (h *recordingHook) Processed(r string, d time.Duration) {
-	if d < 0 {
-		h.add("bad-duration")
-	}
-	h.add("processed:" + r)
-}
-func (h *recordingHook) Retried(r string) { h.add("retried:" + r) }
-func (h *recordingHook) Failed(r string, d time.Duration) {
-	if d < 0 {
-		h.add("bad-duration")
-	}
-	h.add("failed:" + r)
-}
-func (h *recordingHook) DeadLettered(r, reason string) { h.add("dead:" + r + ":" + reason) }
-func (h *recordingHook) AckError(r string)             { h.add("ackerror:" + r) }
-
-type panickingHook struct{ NopMetricsHook }
-
-func (panickingHook) Processed(string, time.Duration) { panic("hook bug") }
 
 // ---------------------------------------------------------------------------
 // 1. Dead-letter
@@ -329,11 +284,8 @@ func TestEnsureGroups(t *testing.T) { eachRedis(t, redisEnsureGroups) }
 // 5. Metrics
 // ---------------------------------------------------------------------------
 
-func redisStatsAndHook(t *testing.T) {
+func redisStats(t *testing.T) {
 	env := newTestEnv(t, func(c *BusConfiguration) { c.NumRetries = 2; c.RetryIdleTime = 600 })
-	hook := &recordingHook{}
-	env.b.SetMetricsHook(hook)
-
 	var failRuns atomic.Int32
 	env.register("ok", func(context.Context, *scriptReceiver) error { return nil })
 	env.register("fails", alwaysFails(&failRuns))
@@ -359,60 +311,9 @@ func redisStatsAndHook(t *testing.T) {
 	env.hook.set(nil)
 
 	require.Equal(t, Stats{Processed: 1, Retried: 1, DeadLettered: 2, Failed: 3, AckErrors: 1, InFlight: 0}, env.b.Stats())
-
-	require.Equal(t, 1, hook.count("processed:ok"))
-	require.Equal(t, 1, hook.count("retried:fails"))
-	require.Equal(t, 3, hook.count("failed:"))
-	require.Equal(t, 1, hook.count("dead:fails:"+DeadReasonRetriesExhausted))
-	require.Equal(t, 1, hook.count("dead:perm:"+DeadReasonPermanent))
-	require.Equal(t, 1, hook.count("ackerror:ok"))
-	require.Zero(t, hook.count("bad-duration"))
 }
 
-func redisHookPanicDoesNotBreakProcessing(t *testing.T) {
-	env := newTestEnv(t, nil)
-	env.b.SetMetricsHook(panickingHook{})
-	env.register("ok", func(context.Context, *scriptReceiver) error { return nil })
-	env.add("ok")
-
-	require.NoError(t, env.b.processMessage(t.Context(), env.deliver()))
-	require.EqualValues(t, 0, env.pending())
-	require.EqualValues(t, 1, env.b.Stats().Processed)
-	require.NotEmpty(t, env.log.errorsMentioning("hook"))
-
-	env.b.SetMetricsHook(nil) // removable
-	env.add("ok")
-	require.NoError(t, env.b.processMessage(t.Context(), env.deliver()))
-}
-
-func redisLag(t *testing.T) {
-	env := newTestEnv(t, nil)
-	env.add("event")
-	env.add("event")
-	env.add("event")
-
-	major, ok := env.b.serverMajorVersion(t.Context())
-	require.True(t, ok)
-	if major < 7 {
-		lag, err := env.b.Lag(t.Context())
-		require.ErrorIs(t, err, ErrorLagUnavailable)
-		require.EqualValues(t, -1, lag)
-		return
-	}
-
-	lag, err := env.b.Lag(t.Context())
-	require.NoError(t, err)
-	require.EqualValues(t, 3, lag, "three messages are waiting for the group")
-
-	env.deliver()
-	lag, err = env.b.Lag(t.Context())
-	require.NoError(t, err)
-	require.EqualValues(t, 2, lag, "a delivered message is no longer lag")
-}
-
-func TestMetrics_StatsAndHook(t *testing.T)      { eachRedis(t, redisStatsAndHook) }
-func TestMetrics_HookPanicIsolated(t *testing.T) { eachRedis(t, redisHookPanicDoesNotBreakProcessing) }
-func TestMetrics_Lag(t *testing.T)               { eachRedis(t, redisLag) }
+func TestMetrics_Stats(t *testing.T) { eachRedis(t, redisStats) }
 
 // ---------------------------------------------------------------------------
 // 6. Retries per receiver

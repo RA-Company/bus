@@ -141,16 +141,16 @@ func redisLegacy(t *testing.T) {
 	bus.AddMessage(ctx, "receiver", ReceiverPayload{
 		Title: faker.Sentence(5),
 		Foo:   faker.Word(),
-	})
+	}, "")
 
 	bus.AddMessage(ctx, "error_receiver", ReceiverPayload{
 		Title: faker.Sentence(5),
 		Foo:   faker.Word(),
-	})
+	}, "")
 	bus.AddMessage(ctx, "panic_receiver", ReceiverPayload{
 		Title: faker.Sentence(5),
 		Foo:   faker.Word(),
-	})
+	}, "")
 
 	require.Eventually(t, func() bool {
 		str, err := redis.Get(t.Context(), "error_test", "")
@@ -162,7 +162,7 @@ func redisLegacy(t *testing.T) {
 // TestAddMessage_EmptyReceiver verifies the early-return error path that does
 // not touch Redis, so no connection is needed.
 func TestAddMessage_EmptyReceiver(t *testing.T) {
-	_, err := (&Bus{}).AddMessage(t.Context(), "", struct{}{})
+	_, err := (&Bus{}).AddMessage(t.Context(), "", struct{}{}, "")
 	require.ErrorIs(t, err, ErrorEmptyReceiverTitle)
 }
 
@@ -175,7 +175,7 @@ func redisAddMessage_NonSerializablePayload(t *testing.T) {
 	b.Init(t.Context(), &BusConfiguration{Redis: *cfg, Stream: uuid.New().String()})
 	defer redis.XGroupDestroy(context.Background(), b.stream, b.group)
 
-	_, err := b.AddMessage(t.Context(), "recv", make(chan int))
+	_, err := b.AddMessage(t.Context(), "recv", make(chan int), "")
 	require.Error(t, err)
 }
 
@@ -188,7 +188,7 @@ func redisAddMessage_Success(t *testing.T) {
 	b.Init(t.Context(), &BusConfiguration{Redis: *cfg, Stream: uuid.New().String()})
 	defer redis.XGroupDestroy(context.Background(), b.stream, b.group)
 
-	id, err := b.AddMessage(t.Context(), "recv", ReceiverPayload{Title: "hello"})
+	id, err := b.AddMessage(t.Context(), "recv", ReceiverPayload{Title: "hello"}, "")
 	require.NoError(t, err)
 	require.NotEmpty(t, id)
 	_, parseErr := uuid.Parse(id)

@@ -74,15 +74,15 @@ func (b *Bus) deadLetter(ctx context.Context, msg re.XMessage, reason, errText s
 // deliberate: if the process dies in between, the message is delivered again and ends up in the
 // dead-letter stream twice (at-least-once) instead of being lost. If moving fails, the message is
 // not acknowledged and stays pending.
-func (b *Bus) discard(ctx context.Context, msg re.XMessage, reason, errText string, deliveries int64) error {
+//
+// kinds are counters to bump together with the dead-letter one (the failed execution of a permanent error).
+func (b *Bus) discard(ctx context.Context, msg re.XMessage, reason, errText string, deliveries int64, kinds ...string) error {
 	if err := b.deadLetter(ctx, msg, reason, errText, deliveries); err != nil {
 		return err
 	}
-	if err := b.ack(ctx, msg); err != nil {
+	if err := b.ack(ctx, msg, append(kinds, kindDead)...); err != nil {
 		return err
 	}
-	receiver, _ := msg.Values["receiver"].(string)
 	b.counters.deadLettered.Add(1)
-	b.emit(ctx, func(h MetricsHook) { h.DeadLettered(receiver, reason) })
 	return nil
 }

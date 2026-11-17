@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/signal"
@@ -30,6 +31,13 @@ var (
 	ErrorInvalidReceiverName   = fmt.Errorf("invalid receiver name")
 	ErrorEmptyTask             = fmt.Errorf("task cannot be empty")
 	ErrorEmptyGroupName        = fmt.Errorf("group name cannot be empty")
+	// ErrorStopTimeout is returned by Stop and Close when running receivers did not finish before the
+	// context expired. Their messages were not acknowledged, so they stay pending and are redelivered.
+	ErrorStopTimeout = fmt.Errorf("bus did not stop in time")
+	// ErrorHandlerTimeout is the error of an execution that ran longer than BusConfiguration.HandlerTimeout.
+	// It is an ordinary failure: the message stays pending and is retried (or dead-lettered when its retries
+	// are exhausted). It is also the cause of the cancelled context the receiver sees.
+	ErrorHandlerTimeout = fmt.Errorf("receiver did not finish in time")
 )
 
 const retryFailed = math.MaxInt // A large number to indicate that a message should not be retried anymore
@@ -52,7 +60,40 @@ type Bus struct {
 	deadSize         int64                      // Maximum number of entries in the dead-letter stream (default: 10000)
 	deadRetention    time.Duration              // How long dead-letter entries are kept (default: 30 days)
 	counters         counters                   // In-process counters, see Stats
-	hook             atomic.Pointer[hookBox]    // Optional metrics hook, see SetMetricsHook
+
+	dedupTTL time.Duration // How long a dedup key is remembered (default: 10 minutes)
+
+	handlerTimeout time.Duration // Longest run of one receiver; 0 = unlimited (default: 10 x RetryIdleTime)
+	stuck          atomic.Int64  // Receivers running past their HandlerTimeout right now
+
+	leaseEvery time.Duration // A running message is renewed when this long has passed since its start or last renewal
+	leaseMu    sync.Mutex    // Guards leases
+	leases     map[leaseKey]lease
+
+	heartbeatEvery time.Duration // How often a running instance renews its workers in the registry
+	aliveTTL       time.Duration // A worker not renewed for this long is dead
+	purgeIdle      time.Duration // Silence after which a consumer record without pending messages is deleted
+
+	statsTTL time.Duration       // How long daily counters stay in Redis; 0 = counters are off
+	tag      string              // Hash tag of the stream's keys (see streamTag); empty = counters are off
+	namesMu  sync.Mutex          // Guards names
+	names    map[string]struct{} // Receiver names counted besides the registered ones, see statName
+
+	claimEvery time.Duration // Minimum interval between two searches for idle messages while nothing is idle
+	lastClaim  atomic.Int64  // Unix nanoseconds of the last search for idle messages
+
+	shutdownTimeout time.Duration // How long Start waits for running receivers after ctx is cancelled
+	lc              sync.Mutex    // Guards stopped, execCancel and the workers WaitGroup counter
+	stopped         bool          // Stop (or the end of Start) has begun, no new workers may start
+	execCancel      context.CancelFunc
+	stopOnce        sync.Once
+	forceOnce       sync.Once
+	closeOnce       sync.Once
+	workers         sync.WaitGroup
+	hbDone          chan struct{} // Closed when the heartbeat has removed the workers from the registry (nil before Start)
+	stopCh          chan struct{} // Closed when the bus begins to stop: workers read no new messages
+	allDone         chan struct{} // Closed when every worker has returned
+	forced          chan struct{} // Closed when waiting for receivers was given up and their contexts cancelled
 }
 
 type BusConfiguration struct {
@@ -62,7 +103,7 @@ type BusConfiguration struct {
 	WorkersCount     int64        // Number of workers to process tasks
 	NumRetries       int64        // Number of retries for failed tasks
 	StreamSize       int64        // Maximum size of the stream
-	RetryIdleTime    int64        // Minimum idle time before retrying a message (in seconds)
+	RetryIdleTime    int64        // How long a worker may be silent before its message is retried (in seconds); a running receiver renews it, see lease.go
 	ShowUnregistered bool         // Whether to show warnings for unregistered receivers
 
 	// DeadLetterStream is the stream that receives messages the bus gave up on (retries exhausted
@@ -74,6 +115,37 @@ type BusConfiguration struct {
 	// (for example 10*24*time.Hour). Entries older than that are trimmed when a new one is written.
 	// Default: 30 days.
 	DeadLetterRetention time.Duration
+
+	// DedupTTL is how long a deduplication key passed to AddMessage is remembered, counted from the
+	// first publication with it. It must cover the longest delay between duplicates; a shorter
+	// time means fewer keys in Redis. Default: 10 minutes. It has no effect without a key.
+	DedupTTL time.Duration
+
+	// StatsRetention is how long the daily counters (published, received, processed, failed, dead-lettered,
+	// ignored; see Counters) are kept in Redis. Default: 30 days. A negative value switches the counters
+	// off: the bus then sends plain XADD and XACK, as before the counters existed.
+	StatsRetention time.Duration
+
+	// ShutdownTimeout is how long Start waits for running receivers after its context is cancelled
+	// (or SIGINT/SIGTERM arrives): no new messages are read, receivers keep running with an
+	// uncancelled context, and when the time is up their context is cancelled and Start returns.
+	// Zero (default) keeps the old behaviour: the receivers' context is cancelled at once and Start
+	// waits for them to return. Stop(ctx) does not depend on this setting.
+	ShutdownTimeout time.Duration
+
+	// HandlerTimeout is the longest time one receiver may run for one message. When it is up the receiver's
+	// context is cancelled (cause ErrorHandlerTimeout) and, whenever the receiver returns, the run counts as a
+	// failure with ErrorHandlerTimeout, even if it returns nil: the message is retried like after any other
+	// failure. The receiver runs in the worker's own goroutine, so there are never more running receivers
+	// than WorkersCount. Go cannot kill a goroutine: a receiver that ignores its context keeps its worker
+	// until it returns (see Stats.Stuck), instead of leaving a goroutine and its connections behind.
+	//
+	// While a receiver runs, the bus keeps the message from being redelivered to another worker (see lease.go),
+	// however long it takes, so the limit is independent of RetryIdleTime. When the limit is over, the lease is
+	// not renewed any more and the message is redelivered RetryIdleTime later at the latest. Zero (default)
+	// means 10 x RetryIdleTime, a negative value switches the limit off: then a receiver that hangs and ignores
+	// its context holds its worker and its message for ever.
+	HandlerTimeout time.Duration
 }
 
 // ReceiverOptions are optional per-receiver settings, see RegisterReceiverWithOptions.
@@ -143,6 +215,15 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 		b.retryIdleTime = 60 // Default to 60 seconds (1 minute) if not provided or invalid
 	}
 
+	switch retryIdle := time.Duration(b.retryIdleTime) * time.Second; {
+	case config.HandlerTimeout < 0:
+	case config.HandlerTimeout == 0:
+		b.handlerTimeout = retryIdle * 10
+	default:
+		b.handlerTimeout = config.HandlerTimeout
+	}
+	b.leaseEvery = time.Duration(b.retryIdleTime) * time.Second / 3
+
 	b.deadStream = config.DeadLetterStream
 	if b.deadStream == "" {
 		b.deadStream = b.stream + ":dead"
@@ -155,6 +236,36 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 	if b.deadRetention <= 0 {
 		b.deadRetention = defaultDeadLetterRetention
 	}
+
+	if tag, err := b.streamTag(); err == nil {
+		b.tag = tag
+		switch {
+		case config.StatsRetention < 0:
+		case config.StatsRetention == 0:
+			b.statsTTL = defaultStatsRetention
+		default:
+			b.statsTTL = config.StatsRetention
+		}
+	} else if config.StatsRetention >= 0 {
+		b.Warnf(ctx, "Counters are off: stream name %q does not allow keys in the stream's hash slot", b.stream)
+	}
+	b.dedupTTL = config.DedupTTL
+	if b.dedupTTL <= 0 {
+		b.dedupTTL = defaultDedupTTL
+	}
+	if config.ShutdownTimeout > 0 {
+		b.shutdownTimeout = config.ShutdownTimeout
+	}
+	// Idle messages are looked for at most this often when the last look found none (see workerJob).
+	b.claimEvery = min(time.Duration(b.retryIdleTime)*time.Second/4, time.Second)
+
+	b.heartbeatEvery = defaultHeartbeatEvery
+	b.aliveTTL = defaultAliveTTL
+	b.purgeIdle = defaultPurgeIdle
+
+	b.stopCh = make(chan struct{})
+	b.allDone = make(chan struct{})
+	b.forced = make(chan struct{})
 
 	err := b.redis.XGroupCreateMkStream(ctx, b.stream, b.group, "$")
 	if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
@@ -284,9 +395,14 @@ func (b *Bus) ReceiversCount() int {
 
 // Start starts the bus by launching the specified number of worker goroutines.
 // Each worker will continuously process tasks from the Redis stream.
-// It waits for all workers to finish before returning.
-// This method is useful for starting the bus and processing tasks concurrently.
-// It uses a WaitGroup to ensure all workers complete before returning.
+// It returns after the bus has stopped: when ctx is cancelled, SIGINT or SIGTERM arrives, or Stop
+// is called (Start then returns once Stop has finished waiting).
+//
+// When ctx is cancelled, the workers stop reading new messages. With BusConfiguration.ShutdownTimeout
+// set, receivers that are already running get that long to finish with an uncancelled context;
+// otherwise (the default) their context is cancelled at once. Either way a message whose receiver did
+// not succeed is not acknowledged and stays pending. Start can be used only once: after Stop it
+// returns immediately.
 //
 // Parameters:
 //   - ctx: The context for the operation, used for cancellation and timeout.
@@ -294,19 +410,177 @@ func (b *Bus) Start(ctx context.Context) {
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var wg sync.WaitGroup
+	// Receivers and reads run with a context that parent cancellation does not touch: a shutdown
+	// must not abort a receiver that is allowed to finish. It is cancelled by cancelExec.
+	execCtx, execCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer execCancel()
 
-	for i := 0; i < int(b.workersCount); i++ {
-		wg.Go(func() {
-			b.safeWorker(ctx)
-		})
+	b.lc.Lock()
+	if b.stopped {
+		b.lc.Unlock()
+		b.Info(ctx, "Bus is already stopped, nothing to start")
+		return
+	}
+	b.execCancel = execCancel
+	b.workers.Add(int(b.workersCount))
+	heartbeatDone := make(chan struct{}) // closed when the heartbeat and the lease renewal have finished
+	b.hbDone = heartbeatDone
+	b.lc.Unlock()
+
+	workers := make([]string, b.workersCount)
+	for i := range workers {
+		workers[i] = uuid.New().String()
+		go func() {
+			defer b.workers.Done()
+			b.safeWorker(execCtx, workers[i])
+		}()
+	}
+	hbDone, leaseDone := make(chan struct{}), make(chan struct{})
+	go b.heartbeat(execCtx, newInstanceName(), workers, hbDone)
+	go b.renewLeases(leaseDone)
+	go func() {
+		<-hbDone
+		<-leaseDone
+		close(heartbeatDone)
+	}()
+
+	select {
+	case <-ctx.Done():
+		b.Info(ctx, "Bus is stopping, waiting for workers to finish")
+		if b.shutdownTimeout > 0 {
+			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.shutdownTimeout)
+			if err := b.Stop(stopCtx); err != nil {
+				b.Errorf(ctx, "Bus stopped with unfinished receivers: %v", err)
+			}
+			cancel()
+		} else {
+			b.beginStop()
+			b.forceStop()
+			<-b.allDone
+		}
+	case <-b.stopCh:
+		// Stop has been called and waits for the workers itself.
+		select {
+		case <-b.allDone:
+		case <-b.forced:
+		}
+	}
+	// The heartbeat removes this instance's workers from the registry once they are gone.
+	select {
+	case <-heartbeatDone:
+	case <-time.After(ackTimeout):
+	}
+	b.Info(ctx, "Bus stopped")
+}
+
+// beginStop makes workers stop reading new messages; running receivers are not touched.
+func (b *Bus) beginStop() {
+	b.stopOnce.Do(func() {
+		b.lc.Lock()
+		b.stopped = true
+		b.lc.Unlock()
+		close(b.stopCh)
+		go func() {
+			b.workers.Wait()
+			close(b.allDone)
+		}()
+	})
+}
+
+// forceStop cancels the context of running receivers and the reads of the workers.
+func (b *Bus) forceStop() {
+	b.forceOnce.Do(func() {
+		b.lc.Lock()
+		cancel := b.execCancel
+		b.lc.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		close(b.forced)
+	})
+}
+
+// Stop stops the bus gracefully. Workers stop reading new messages at once (a read that is already
+// blocked on an empty stream returns within a second), and Stop waits until the messages being processed
+// are finished and acknowledged. Messages that were not read stay in the stream for the next run, and
+// a message whose receiver did not succeed is not acknowledged and stays pending.
+//
+// If ctx expires first, the context of the running receivers is cancelled so that they can abort,
+// and Stop returns an error wrapping ErrorStopTimeout and ctx.Err() without waiting further: a receiver
+// that ignores its context keeps running in the background, and its message stays pending until it is
+// acknowledged by the receiver's own success or redelivered after RetryIdleTime.
+//
+// Stop is safe to call several times and concurrently, also before Start (Start then does nothing)
+// or without Start. The bus cannot be started again after Stop.
+func (b *Bus) Stop(ctx context.Context) error {
+	b.beginStop()
+
+	select {
+	case <-b.allDone:
+		b.waitHeartbeat(ctx)
+		return nil
+	case <-ctx.Done():
 	}
 
-	<-ctx.Done()
-	b.Info(ctx, "Bus stopped, waiting for workers to finish")
+	// A worker that finished while ctx expired is not a timeout.
+	select {
+	case <-b.allDone:
+		b.waitHeartbeat(ctx)
+		return nil
+	default:
+	}
 
-	wg.Wait()
-	b.Info(ctx, "All workers finished, bus stopped")
+	b.forceStop()
+	inFlight := b.inFlight.Load()
+	b.Errorf(ctx, "Stop timed out with %d message(s) still being processed, they stay pending", inFlight)
+	return fmt.Errorf("%w: %d message(s) still being processed, left pending: %w", ErrorStopTimeout, inFlight, ctx.Err())
+}
+
+// waitHeartbeat waits until the heartbeat has removed this instance's workers from the registry of live
+// consumers, for at most ackTimeout and not beyond ctx. Without Start there is nothing to wait for.
+func (b *Bus) waitHeartbeat(ctx context.Context) {
+	b.lc.Lock()
+	done := b.hbDone
+	b.lc.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		return
+	default:
+	}
+	timer := time.NewTimer(ackTimeout + time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+// Close stops the bus like Stop and then closes the Redis connection. After Close the bus cannot be
+// used. The Redis connection is closed even if Stop timed out; the error of Stop is returned.
+func (b *Bus) Close(ctx context.Context) error {
+	err := b.Stop(ctx)
+	// The registry is written through the connection that is closed next. If Stop has already used up ctx, the
+	// instance still gets a second to leave it.
+	wctx := ctx
+	if ctx.Err() != nil {
+		var cancel context.CancelFunc
+		wctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+		defer cancel()
+	}
+	b.waitHeartbeat(wctx)
+	b.closeOnce.Do(func() {
+		if closer, ok := b.redis.Client().(io.Closer); ok {
+			if cerr := closer.Close(); cerr != nil {
+				b.Errorf(ctx, "Failed to close Redis connection: %v", cerr)
+				err = errors.Join(err, cerr)
+			}
+		}
+	})
+	return err
 }
 
 // AddMessage adds a new message to the bus stream.
@@ -318,10 +592,16 @@ func (b *Bus) Start(ctx context.Context) {
 //   - ctx: The context for the operation.
 //   - receiver: The title of the receiver.
 //   - payload: The payload for the receiver, which can be any data type.
+//   - dedupKey: Deduplication key; empty means none, and AddMessage then adds the message unconditionally. While the key is
+//     remembered (BusConfiguration.DedupTTL, 10 minutes by default), a second message with the same key and
+//     receiver is not added: AddMessage returns the id of the first message and a nil error, and
+//     Stats().Deduplicated grows. The key is chosen by the producer, for example a hash of the raw body of a
+//     webhook. The check and the XADD are one atomic Redis script, so it also works between hosts.
 //
 // Returns:
+//   - string: The id of the message (of the first one for a duplicate).
 //   - error: An error if the receiver title is empty or if adding the receiver to the stream fails.
-func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any) (string, error) {
+func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any, dedupKey string) (string, error) {
 	if receiver == "" {
 		return "", ErrorEmptyReceiverTitle
 	}
@@ -332,18 +612,30 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any) (str
 	}
 
 	id := uuid.New().String()
-	message := map[string]any{
-		"receiver": receiver,                                  // Receiver title
-		"id":       id,                                        // Unique ID for the message
-		"payload":  string(data),                              // Serialized payload
-		"time":     time.Now().UTC().Format(time.RFC3339Nano), // Current time in RFC3339Nano format
-	}
+	stamp := time.Now().UTC().Format(time.RFC3339Nano) // Current time in RFC3339Nano format
 
-	_, err = b.redis.XAdd(ctx, &re.XAddArgs{
-		Stream: b.stream,
-		Values: message,
-		MaxLen: int64(b.streamSize), // Limit the stream size
-	})
+	if dedupKey == "" && !b.statsOn() {
+		_, err = b.redis.XAdd(ctx, &re.XAddArgs{
+			Stream: b.stream,
+			Values: map[string]any{
+				"receiver": receiver,     // Receiver title
+				"id":       id,           // Unique ID for the message
+				"payload":  string(data), // Serialized payload
+				"time":     stamp,
+			},
+			MaxLen: int64(b.streamSize), // Limit the stream size
+		})
+	} else {
+		// XADD, the deduplication check and the "published" counters in one call.
+		var added bool
+		var first string
+		first, added, err = b.publish(ctx, receiver, string(data), id, stamp, dedupKey)
+		if err == nil && !added {
+			b.counters.deduplicated.Add(1)
+			b.Infof(ctx, "Message %q is a duplicate in stream %q, the first one has ID %q", receiver, b.stream, first)
+			return first, nil
+		}
+	}
 	if err != nil {
 		b.Errorf(ctx, "b.redis.XAdd() error: %v", err)
 		return "", err
@@ -362,13 +654,16 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any) (str
 //
 // Parameters:
 //   - ctx: The context for the worker, used for cancellation and timeout.
-func (b *Bus) safeWorker(ctx context.Context) {
-	worker := uuid.New().String()
+func (b *Bus) safeWorker(ctx context.Context, worker string) {
 	ctx = context.WithValue(ctx, logging.CtxKeyUUID, worker)
+	ctx = context.WithValue(ctx, workerKey{}, worker)
 	b.Infof(ctx, "Worker %q was started", worker)
 
 	for {
 		select {
+		case <-b.stopCh:
+			b.Infof(ctx, "Worker %q was stopped", worker)
+			return
 		case <-ctx.Done():
 			b.Infof(ctx, "Worker %q was stopped", worker)
 			return
@@ -386,39 +681,41 @@ func (b *Bus) safeWorker(ctx context.Context) {
 	}
 }
 
-// workerJob is a goroutine that continuously processes messages from the Redis stream.
-// It auto-claims messages that have been idle for a specified minimum time and executes them.
-// If a message fails to execute, it retries the message based on the configured retry logic.
-// The worker will log its status and any errors encountered during processing.
-// It will also handle graceful shutdown when the context is done.
+// workerJob is a goroutine body that processes one message from the Redis stream per call.
+// It auto-claims a message that has been idle for the minimum time and executes it, else reads the next
+// new message of the group. If a message fails to execute, it is retried based on the configured retry logic.
+//
+// Cost per message on the hot path: one XREADGROUP and one XACK. A message that was just read has been
+// delivered exactly once, so its delivery counter is not requested from Redis. The search for idle messages is not run
+// before every read: after a search that found nothing the next one is made at most every
+// min(RetryIdleTime/4, 1s) by any worker, and while it keeps finding idle messages it runs back to back
+// (see claimIdle for how they are found).
 //
 // Parameters:
 //   - ctx: The context for the worker, used for cancellation and timeout.
 //   - worker: The unique identifier for the worker, used for logging and claiming messages.
 func (b *Bus) workerJob(ctx context.Context, worker string) {
-	claims, err := b.redis.XAutoClaim(ctx, &re.XAutoClaimArgs{
-		Stream:   b.stream,
-		Group:    b.group,
-		Consumer: worker,
-		MinIdle:  time.Duration(b.retryIdleTime) * time.Second, // Minimum idle time for auto claim
-		Count:    1,
-		Start:    "0-0",
-	})
-
-	if err != nil {
-		b.Errorf(ctx, "Failed to auto claim message: %v", err)
-		// Wait before retrying and check for context cancellation to avoid tight loop on errors
-		select {
-		case <-time.After(5 * time.Second):
-		case <-ctx.Done():
+	if b.claimDue() {
+		msg, deliveries, found, err := b.claimIdle(ctx, worker)
+		if err != nil {
+			b.Errorf(ctx, "Failed to claim an idle message: %v", err)
+			// Wait before retrying and check for stop to avoid a tight loop on errors
+			select {
+			case <-time.After(5 * time.Second):
+			case <-b.stopCh:
+			case <-ctx.Done():
+			}
 			return
 		}
-		return
-	}
 
-	if len(claims) == 1 {
-		b.logProcessError(ctx, claims[0], b.processMessage(ctx, claims[0]))
-		return
+		if found {
+			b.lastClaim.Store(0) // there may be more idle messages: look again at once
+			if b.abandoned(ctx, msg) {
+				return
+			}
+			b.logProcessError(ctx, msg, b.handle(ctx, msg, deliveries))
+			return
+		}
 	}
 
 	messages, err := b.redis.XReadGroup(ctx, &re.XReadGroupArgs{
@@ -441,7 +738,88 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		return
 	}
 
-	b.logProcessError(ctx, messages[0].Messages[0], b.processMessage(ctx, messages[0].Messages[0]))
+	if b.abandoned(ctx, messages[0].Messages[0]) {
+		return
+	}
+
+	// XREADGROUP ">" delivers an entry for the first time, so its delivery counter is 1.
+	b.logProcessError(ctx, messages[0].Messages[0], b.handle(ctx, messages[0].Messages[0], 1))
+}
+
+// abandoned reports whether the bus has given up on running receivers (Stop timed out or the shutdown
+// timeout passed). A read that was already blocked when that happened (go-redis does not interrupt a
+// blocked read when its context is cancelled) may still bring a message; it is not executed and stays
+// pending, so it is redelivered after RetryIdleTime. Without it, a message read while Stop is
+// waiting gracefully is processed and Stop waits for it.
+func (b *Bus) abandoned(ctx context.Context, msg re.XMessage) bool {
+	select {
+	case <-b.forced:
+		b.Warnf(ctx, "Bus is stopped, message %q (stream id %q) is left pending", msg.Values["id"], msg.ID)
+		return true
+	default:
+		return false
+	}
+}
+
+// claimCandidates is how many idle pending entries one search asks for. Several, because a candidate
+// can be taken by another worker between the search and the claim.
+const claimCandidates = 10
+
+// claimIdle takes one message that has been pending without acknowledgement for at least RetryIdleTime
+// and returns it with its delivery counter including this delivery.
+//
+// It does not use XAUTOCLAIM: that command looks only at the first Count*10 entries of the pending list
+// (ordered by entry id, not by delivery time), so an idle message behind ten recently redelivered ones
+// is not found until those are gone. XPENDING with IDLE lets Redis pick the idle entries from the whole
+// list, and XCLAIM with MINIDLE takes one atomically: if another worker has taken it meanwhile, its idle time
+// has been reset and the claim returns nothing, so the next candidate is tried. XCLAIM adds one to the
+// delivery counter that XPENDING reported, which saves a separate read of the counter.
+// found is false when there is nothing to redeliver.
+func (b *Bus) claimIdle(ctx context.Context, worker string) (msg re.XMessage, deliveries int64, found bool, err error) {
+	minIdle := time.Duration(b.retryIdleTime) * time.Second
+	client := b.redis.Client()
+
+	candidates, err := client.XPendingExt(ctx, &re.XPendingExtArgs{
+		Stream: b.stream,
+		Group:  b.group,
+		Idle:   minIdle,
+		Start:  "-",
+		End:    "+",
+		Count:  claimCandidates,
+	}).Result()
+	if err != nil {
+		if errors.Is(err, re.Nil) {
+			return msg, 0, false, nil
+		}
+		return msg, 0, false, err
+	}
+
+	for _, c := range candidates {
+		claimed, err := client.XClaim(ctx, &re.XClaimArgs{
+			Stream:   b.stream,
+			Group:    b.group,
+			Consumer: worker,
+			MinIdle:  minIdle,
+			Messages: []string{c.ID},
+		}).Result()
+		if err != nil {
+			return msg, 0, false, err
+		}
+		// Nothing is returned when another worker was faster, or when the entry was trimmed from the
+		// stream (Redis 7 then drops it from the pending list as well).
+		if len(claimed) == 1 {
+			return claimed[0], c.RetryCount + 1, true, nil
+		}
+	}
+	return msg, 0, false, nil
+}
+
+// claimDue reports whether this worker should look for idle messages now. Among concurrent workers
+// only one wins a slot per interval.
+func (b *Bus) claimDue() bool {
+	now := time.Now().UnixNano()
+	last := b.lastClaim.Load()
+	return now-last >= int64(b.claimEvery) && b.lastClaim.CompareAndSwap(last, now)
 }
 
 // logProcessError logs a processMessage failure. Messages for unregistered receivers are
@@ -459,7 +837,7 @@ func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
 //
 // Delivery is "at least once": the message is acknowledged only after the receiver has succeeded.
 // If the receiver fails (or panics), the message stays pending in the consumer group and is
-// redelivered by XAUTOCLAIM after RetryIdleTime. The number of attempts is the delivery counter
+// redelivered (XPENDING IDLE + XCLAIM) after RetryIdleTime. The number of attempts is the delivery counter
 // Redis keeps for every pending entry (XPENDING), so it is atomic, survives restarts of the
 // workers and disappears together with the entry on XACK. A message that has been delivered more
 // than the allowed number of times (ReceiverOptions.NumRetries of the receiver, else NumRetries of
@@ -479,10 +857,16 @@ func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
 //   - error: An error if the receiver fails to start or execute, or if the message could not be
 //     acknowledged, moved to the dead-letter stream or its delivery counter could not be read, otherwise nil.
 func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
+	return b.handle(ctx, msg, 0)
+}
+
+// handle is processMessage with an optional known delivery counter: a positive value is used instead
+// of asking Redis (the worker passes 1 for a message it has just read with XREADGROUP).
+func (b *Bus) handle(ctx context.Context, msg re.XMessage, knownDeliveries int64) error {
 	receiverName, ok := msg.Values["receiver"].(string)
 	if !ok {
 		b.Errorf(ctx, "Message %q does not contain a valid receiver name", msg.ID)
-		_ = b.ack(ctx, msg) // failure is logged inside
+		_ = b.ack(ctx, msg, kindInvalid) // failure is logged inside
 		return ErrorInvalidReceiverName
 	}
 
@@ -496,11 +880,14 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 		if b.showUnregistered {
 			b.Warnf(ctx, "Receiver %q is not registered", receiverName)
 		}
-		_ = b.ack(ctx, msg) // failure is logged inside
+		_ = b.ack(ctx, msg, kindUnregistered) // failure is logged inside
 		return ErrorReceiverNotRegistered
 	}
 
-	deliveries, pending, err := b.deliveryCount(ctx, msg.ID)
+	deliveries, pending, err := knownDeliveries, true, error(nil)
+	if knownDeliveries <= 0 {
+		deliveries, pending, err = b.deliveryCount(ctx, msg.ID)
+	}
 	if err != nil {
 		b.Errorf(ctx, "Failed to read delivery count of message %q, leaving it pending for redelivery: %v", msg.ID, err)
 		return fmt.Errorf("read delivery count of message %s: %w", msg.ID, err)
@@ -522,32 +909,74 @@ func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
 	}
 	if deliveries > 1 {
 		b.counters.retried.Add(1)
-		b.emit(ctx, func(h MetricsHook) { h.Retried(receiverName) })
 	}
 
-	started := time.Now()
-	if err = b.execute(ctx, factory(), msg); err != nil {
-		took := time.Since(started)
+	endLease := b.leaseStart(ctx, msg.ID)
+	err = b.executeLimited(ctx, factory(), msg)
+	endLease()
+	if err != nil {
 		b.counters.failed.Add(1)
-		b.emit(ctx, func(h MetricsHook) { h.Failed(receiverName, took) })
 
 		if IsPermanent(err) {
 			b.Errorf(ctx, "Receiver %q failed permanently, message %q is not retried: %v", receiverName, msg.ID, err)
-			if derr := b.discard(ctx, msg, DeadReasonPermanent, err.Error(), deliveries); derr != nil {
+			// The failed execution is counted together with the move to the dead-letter stream.
+			if derr := b.discard(ctx, msg, DeadReasonPermanent, err.Error(), deliveries, retriedIf(deliveries, kindFailed)...); derr != nil {
 				return errors.Join(err, derr)
 			}
+		} else {
+			b.recordFailure(ctx, msg, retriedIf(deliveries, kindFailed)...)
 		}
 		return err
 	}
-	took := time.Since(started)
 
-	if err = b.ack(ctx, msg); err != nil {
+	if err = b.ack(ctx, msg, retriedIf(deliveries, kindProcessed)...); err != nil {
 		return err
 	}
 	b.counters.processed.Add(1)
-	b.emit(ctx, func(h MetricsHook) { h.Processed(receiverName, took) })
 
 	return nil
+}
+
+// executeLimited is execute with the HandlerTimeout. The receiver runs in the worker's own goroutine, so the
+// number of receivers running at once never exceeds WorkersCount, whatever they do. When the time is up its
+// context is cancelled (cause ErrorHandlerTimeout) and the run is counted as timed out at once; a run that
+// has exceeded the limit is a failure when the receiver returns, even if it returns nil: the message stays
+// pending and is retried. A receiver that ignores its context cannot be killed in Go, so it keeps its
+// worker until it returns; Stats.Stuck shows how many such runs there are right now.
+// If ctx itself is cancelled (shutdown), it is not a timeout.
+func (b *Bus) executeLimited(ctx context.Context, receiver ReceiverInterface, msg re.XMessage) error {
+	if b.handlerTimeout <= 0 {
+		return b.execute(ctx, receiver, msg)
+	}
+
+	tctx, cancel := context.WithTimeoutCause(ctx, b.handlerTimeout, ErrorHandlerTimeout)
+	defer cancel()
+
+	fired := make(chan struct{}) // closed when the deadline has been handled
+	stop := context.AfterFunc(tctx, func() {
+		defer close(fired)
+		if errors.Is(context.Cause(tctx), ErrorHandlerTimeout) {
+			b.counters.timedOut.Add(1)
+			b.stuck.Add(1)
+			b.leaseEnd(workerOf(ctx), msg.ID) // a receiver past its limit does not keep the message from being redelivered
+			b.Errorf(ctx, "Receiver %q did not finish message %q within %s, its context is cancelled", msg.Values["receiver"], msg.ID, b.handlerTimeout)
+		}
+	})
+
+	err := b.execute(tctx, receiver, msg)
+
+	if stop() { // the deadline did not come before the receiver returned
+		return err
+	}
+	<-fired
+	if !errors.Is(context.Cause(tctx), ErrorHandlerTimeout) {
+		return err // ctx was cancelled by the bus shutting down
+	}
+	b.stuck.Add(-1)
+	if err != nil {
+		return fmt.Errorf("%w: receiver %v, message %s, limit %s: %w", ErrorHandlerTimeout, msg.Values["receiver"], msg.ID, b.handlerTimeout, err)
+	}
+	return fmt.Errorf("%w: receiver %v, message %s, limit %s", ErrorHandlerTimeout, msg.Values["receiver"], msg.ID, b.handlerTimeout)
 }
 
 // execute starts the receiver, runs it and finishes it. A panic inside the receiver is recovered
@@ -582,26 +1011,31 @@ func (b *Bus) execute(ctx context.Context, receiver ReceiverInterface, msg re.XM
 // ackTimeout limits how long an acknowledgement or a dead-letter write may take.
 const ackTimeout = 5 * time.Second
 
-// ack acknowledges a message in the consumer group. A failure is logged together with the message
-// id, counted and returned: the message then stays pending and will be redelivered.
+// ack acknowledges a message in the consumer group and counts the outcome (kinds, see stats.go) in the
+// same call. A failure is logged together with the message id, counted and returned: the message then
+// stays pending and will be redelivered.
 // The acknowledgement deliberately ignores cancellation of ctx (bus shutdown), otherwise a receiver
 // that has just finished successfully would be executed again after the restart.
-func (b *Bus) ack(ctx context.Context, msg re.XMessage) error {
+func (b *Bus) ack(ctx context.Context, msg re.XMessage, kinds ...string) error {
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 
-	if _, err := b.redis.XAck(ackCtx, b.stream, b.group, msg.ID); err != nil {
+	var err error
+	if b.statsOn() {
+		err = b.runOutcome(ackCtx, msg, true, kinds)
+	} else {
+		_, err = b.redis.XAck(ackCtx, b.stream, b.group, msg.ID)
+	}
+	if err != nil {
 		b.Errorf(ctx, "Failed to acknowledge message %q (stream %q, group %q), it stays pending and will be redelivered: %v", msg.ID, b.stream, b.group, err)
 		b.counters.ackErrors.Add(1)
-		receiver, _ := msg.Values["receiver"].(string)
-		b.emit(ctx, func(h MetricsHook) { h.AckError(receiver) })
 		return fmt.Errorf("acknowledge message %s: %w", msg.ID, err)
 	}
 	return nil
 }
 
 // deliveryCount returns how many times Redis has delivered the pending entry id to the group
-// (XREADGROUP counts the first delivery, every XCLAIM/XAUTOCLAIM adds one), including the current one.
+// (XREADGROUP counts the first delivery, every XCLAIM adds one), including the current one.
 // pending is false when the entry is not in the pending list any more.
 // An error means that the counter could not be read, which is different from an exhausted limit.
 func (b *Bus) deliveryCount(ctx context.Context, id string) (deliveries int64, pending bool, err error) {

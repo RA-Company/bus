@@ -75,14 +75,14 @@ func (h *faultHook) ProcessPipelineHook(next re.ProcessPipelineHook) re.ProcessP
 // fails.
 func denyAllExceptStreamDelivery(cmd string) bool {
 	switch cmd {
-	case "xack", "xadd", "xreadgroup", "xautoclaim", "xgroup", "hello", "ping", "client", "info":
+	case "xack", "xadd", "xreadgroup", "xautoclaim", "xclaim", "xgroup", "evalsha", "eval", "hello", "ping", "client", "info":
 		return false
 	}
 	return true
 }
 
-// denyAck simulates a failing XACK only.
-func denyAck(cmd string) bool { return cmd == "xack" }
+// denyAck simulates a failing acknowledgement: XACK, and the script that acknowledges and counts.
+func denyAck(cmd string) bool { return cmd == "xack" || cmd == "evalsha" || cmd == "eval" }
 
 // captureLogger records everything the bus logs so tests can make assertions on it.
 type captureLogger struct {
@@ -182,6 +182,12 @@ func newTestEnv(t *testing.T, mutate func(*BusConfiguration)) *testEnv {
 		_ = rdb.XGroupDestroy(ctx, b.stream, b.group)
 		_ = rdb.Del(ctx, b.stream)
 		_ = rdb.Del(ctx, b.deadStream)
+		// counters and dedup keys live in the stream's hash slot: {<stream>}:...
+		if keys, err := scanAll(ctx, rdb.Client(), "{"+b.stream+"}:*"); err == nil {
+			for _, k := range keys {
+				_ = rdb.Del(ctx, k)
+			}
+		}
 		if keys, err := scanAll(ctx, rdb.Client(), b.stream+":retry:*"); err == nil {
 			for _, k := range keys {
 				_ = rdb.Del(ctx, k)
@@ -247,7 +253,7 @@ func (e *testEnv) register(name string, run func(ctx context.Context, r *scriptR
 // add publishes a message through the public API.
 func (e *testEnv) add(receiver string) string {
 	e.t.Helper()
-	id, err := e.b.AddMessage(e.t.Context(), receiver, ReceiverPayload{Title: "t", Foo: "f"})
+	id, err := e.b.AddMessage(e.t.Context(), receiver, ReceiverPayload{Title: "t", Foo: "f"}, "")
 	require.NoError(e.t, err)
 	return id
 }
