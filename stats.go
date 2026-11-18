@@ -25,7 +25,7 @@ import (
 // Counters are written together with XACK (consumer) and XADD (producer), so the number of Redis round trips
 // per message does not change. A failure to update a counter never fails the delivery or the publication.
 const (
-	kindReceived     = "received"     // handling of a delivered message finished, whatever the outcome
+	kindReceived     = "received"     // handling of a delivered message finished, whatever the outcome, except a duplicate
 	kindProcessed    = "processed"    // receiver succeeded, message acknowledged
 	kindFailed       = "failed"       // execution failed (error, panic, failed to start)
 	kindRetried      = "retried"      // execution of a message that had been delivered before
@@ -34,6 +34,7 @@ const (
 	kindInvalid      = "invalid"      // no valid receiver name in the message, acknowledged and dropped
 	kindPublished    = "published"
 	kindDeduplicated = "deduplicated"
+	kindDuplicate    = "duplicate" // the run finished, but the message had been acknowledged by another run already
 )
 
 const (
@@ -52,7 +53,12 @@ var ErrorStatsUnavailable = errors.New("counters are not available for this stre
 // outcomeScript acknowledges a message (optional) and bumps counters in one step.
 //
 //	KEYS[1] stream, KEYS[2] counters hash of the day (same hash slot)
-//	ARGV[1] "1" to XACK, ARGV[2] group, ARGV[3] entry id, ARGV[4] counters TTL in ms, ARGV[5...] fields to add 1 to
+//	ARGV[1] "1" to XACK, ARGV[2] group, ARGV[3] entry id, ARGV[4] counters TTL in ms,
+//	ARGV[5] receiver name for the per-receiver fields ("" = totals only), ARGV[6...] kinds
+//
+// Every kind is counted as a total and per receiver, together with "received". If the acknowledgement finds the
+// message acknowledged already (another run of it finished first: a late success after HandlerTimeout, or an
+// at-least-once duplicate), the outcome is not counted again: only "duplicate" is.
 //
 // The acknowledgement goes first and the counters are updated with pcall: a script is not rolled back, and a
 // problem with a counter must neither leave the message unacknowledged nor fail the call.
@@ -61,19 +67,31 @@ local acked = 0
 if ARGV[1] == '1' then
   acked = redis.call('XACK', KEYS[1], ARGV[2], ARGV[3])
 end
-for i = 5, #ARGV do
-  redis.pcall('HINCRBY', KEYS[2], ARGV[i], 1)
+local function bump(kind)
+  redis.pcall('HINCRBY', KEYS[2], kind, 1)
+  if ARGV[5] ~= '' then
+    redis.pcall('HINCRBY', KEYS[2], kind .. ':' .. ARGV[5], 1)
+  end
+end
+if ARGV[1] == '1' and acked == 0 then
+  bump('duplicate')
+else
+  bump('received')
+  for i = 6, #ARGV do
+    bump(ARGV[i])
+  end
 end
 redis.pcall('PEXPIRE', KEYS[2], ARGV[4], 'NX')
 return acked
 `)
 
 // publishScript adds a message to the stream, optionally unless a deduplication key is remembered, and counts it.
+// If this XADD creates the stream (it did not exist), the stream is marked as recreated (see rebirth.go).
 //
-//	KEYS[1] stream, KEYS[2] published counters of the day, KEYS[3] dedup key (only with a deduplication key);
-//	all in the same hash slot
-//	ARGV    MAXLEN, counters TTL in ms ("0" = no counters), message id, receiver, payload, time,
-//	        receiver name for the counters, dedup TTL in ms
+//	KEYS[1] stream, KEYS[2] published counters of the day, KEYS[3] mark of a recreated stream,
+//	KEYS[4] dedup key (only with a deduplication key); all in the same hash slot
+//	ARGV    MAXLEN (approximate), counters TTL in ms ("0" = no counters), message id, receiver, payload, time,
+//	        receiver name for the counters, dedup TTL in ms, mark TTL in ms ("0" = no mark)
 //
 // It returns {1, id} when the message was added and {0, id of the first message} for a duplicate.
 // XADD goes before SET: a script is not rolled back on an error, and a failed XADD must not leave a key that
@@ -89,17 +107,21 @@ local function count(name)
   end
 end
 
-if KEYS[3] then
-  local first = redis.call('GET', KEYS[3])
+if KEYS[4] then
+  local first = redis.call('GET', KEYS[4])
   if first then
     count('deduplicated')
     return {0, first}
   end
 end
-redis.call('XADD', KEYS[1], 'MAXLEN', ARGV[1], '*',
+local new = ARGV[9] ~= '0' and redis.call('EXISTS', KEYS[1]) == 0
+redis.call('XADD', KEYS[1], 'MAXLEN', '~', ARGV[1], '*',
   'receiver', ARGV[4], 'id', ARGV[3], 'payload', ARGV[5], 'time', ARGV[6])
-if KEYS[3] then
-  redis.call('SET', KEYS[3], ARGV[3], 'PX', ARGV[8])
+if new then
+  redis.call('SET', KEYS[3], '1', 'PX', ARGV[9])
+end
+if KEYS[4] then
+  redis.call('SET', KEYS[4], ARGV[3], 'PX', ARGV[8])
 end
 count('published')
 return {1, ARGV[3]}
@@ -108,7 +130,7 @@ return {1, ARGV[3]}
 // publish runs publishScript. It returns the id of the message that is in the stream (the first one for a
 // duplicate) and whether this call added one.
 func (b *Bus) publish(ctx context.Context, receiver, payload, id, stamp, dedupKey string) (string, bool, error) {
-	keys := []string{b.stream, b.publishedStatsKey(statsDate(time.Now()))}
+	keys := []string{b.stream, b.publishedStatsKey(statsDate(time.Now())), b.rebornKey()}
 	dedupTTL := int64(0)
 	if dedupKey != "" {
 		key, err := b.dedupKeyName(receiver, dedupKey)
@@ -122,9 +144,13 @@ func (b *Bus) publish(ctx context.Context, receiver, payload, id, stamp, dedupKe
 	if b.statsOn() {
 		statsTTL = b.statsTTL.Milliseconds()
 	}
+	rebirthTTL := int64(0)
+	if b.rebirthTTL > 0 {
+		rebirthTTL = max(b.rebirthTTL.Milliseconds(), 1)
+	}
 
 	res, err := publishScript.Run(ctx, b.redis.Client(), keys,
-		b.streamSize, statsTTL, id, receiver, payload, stamp, b.statName(receiver), dedupTTL).Slice()
+		b.streamSize, statsTTL, id, receiver, payload, stamp, b.statName(receiver), dedupTTL, rebirthTTL).Slice()
 	if err != nil {
 		return "", false, err
 	}
@@ -189,31 +215,22 @@ func (b *Bus) statName(receiver string) string {
 	return receiver
 }
 
-// outcomeFields lists the counter fields to bump for one finished delivery: "received" and every kind,
-// each as a total and, when the receiver is known, per receiver.
-func (b *Bus) outcomeFields(receiver string, kinds []string) []any {
-	name := b.statName(receiver)
-	fields := make([]any, 0, 2*(len(kinds)+1))
-	for _, kind := range append([]string{kindReceived}, kinds...) {
-		fields = append(fields, kind)
-		if name != "" {
-			fields = append(fields, kind+":"+name)
-		}
-	}
-	return fields
-}
-
-// runOutcome acknowledges the message (when ack is set) and bumps the counters in one script call.
-func (b *Bus) runOutcome(ctx context.Context, msg re.XMessage, ack bool, kinds []string) error {
+// runOutcome acknowledges the message (when ack is set) and bumps the counters in one script call. It returns
+// whether the acknowledgement removed the message from the pending list (false: acknowledged before).
+func (b *Bus) runOutcome(ctx context.Context, msg re.XMessage, ack bool, kinds []string) (bool, error) {
 	receiver, _ := msg.Values["receiver"].(string)
 	flag := "0"
 	if ack {
 		flag = "1"
 	}
-	args := []any{flag, b.group, msg.ID, b.statsTTL.Milliseconds()}
-	args = append(args, b.outcomeFields(receiver, kinds)...)
+	args := make([]any, 0, 5+len(kinds))
+	args = append(args, flag, b.group, msg.ID, b.statsTTL.Milliseconds(), b.statName(receiver))
+	for _, kind := range kinds {
+		args = append(args, kind)
+	}
 	keys := []string{b.stream, b.groupStatsKey(b.group, statsDate(time.Now()))}
-	return outcomeScript.Run(ctx, b.redis.Client(), keys, args...).Err()
+	n, err := outcomeScript.Run(ctx, b.redis.Client(), keys, args...).Int64()
+	return n == 1, err
 }
 
 // recordFailure counts a failed execution. The message is not acknowledged. A failure to write the counter
@@ -224,7 +241,7 @@ func (b *Bus) recordFailure(ctx context.Context, msg re.XMessage, kinds ...strin
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
-	if err := b.runOutcome(ctx, msg, false, kinds); err != nil {
+	if _, err := b.runOutcome(ctx, msg, false, kinds); err != nil {
 		b.Warnf(ctx, "Failed to update counters of message %q: %v", msg.ID, err)
 	}
 }
@@ -245,13 +262,17 @@ func retriedIf(deliveries int64, kinds ...string) []string {
 type Counters struct {
 	Published    int64 `json:"published"`    // messages added to the stream
 	Deduplicated int64 `json:"deduplicated"` // publications skipped as duplicates (AddMessage with a dedup key)
-	Received     int64 `json:"received"`     // deliveries whose handling finished, whatever the outcome
+	Received     int64 `json:"received"`     // deliveries whose handling finished, whatever the outcome, except Duplicates
 	Processed    int64 `json:"processed"`    // receiver succeeded and the message was acknowledged
 	Failed       int64 `json:"failed"`       // executions that failed to start, returned an error or panicked
 	Retried      int64 `json:"retried"`      // executions of a message that had been delivered before
 	DeadLettered int64 `json:"dead_lettered"`
 	Unregistered int64 `json:"unregistered"` // messages for receivers this service has not registered
 	Invalid      int64 `json:"invalid"`      // messages without a valid receiver name
+	// Duplicates are runs whose message had been acknowledged by another run already when this one acknowledged
+	// it (a late success after HandlerTimeout, or an at-least-once duplicate); they are not counted in any other
+	// field again.
+	Duplicates int64 `json:"duplicates"`
 }
 
 func (c *Counters) add(metric string, v int64) {
@@ -274,6 +295,8 @@ func (c *Counters) add(metric string, v int64) {
 		c.Unregistered = v
 	case kindInvalid:
 		c.Invalid = v
+	case kindDuplicate:
+		c.Duplicates = v
 	}
 }
 
@@ -293,6 +316,9 @@ type DayCounters struct {
 // "Received" counts a delivery when its handling has finished, so a message that is being executed now, or
 // whose worker died, is counted when it finishes or is redelivered.
 func (b *Bus) Counters(ctx context.Context, group string, days int) ([]DayCounters, error) {
+	if err := b.ready(); err != nil {
+		return nil, err
+	}
 	if b.tag == "" {
 		return nil, ErrorStatsUnavailable
 	}
@@ -375,6 +401,9 @@ type Snapshot struct {
 // of the stream, not only the bus' own one, so one service can watch all consumers. It costs a few Redis
 // commands, plus one per group that has pending messages.
 func (b *Bus) Snapshot(ctx context.Context) (Snapshot, error) {
+	if err := b.ready(); err != nil {
+		return Snapshot{}, err
+	}
 	client := b.redis.Client()
 	snap := Snapshot{Stream: b.stream, SizeLimit: b.streamSize}
 

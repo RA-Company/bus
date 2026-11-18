@@ -139,14 +139,13 @@ func redisStatsOff(t *testing.T) {
 	require.NoError(t, env.b.processMessage(t.Context(), env.deliver()))
 
 	snap := hook.snapshot()
-	require.EqualValues(t, 1, snap["xadd"])
-	require.EqualValues(t, 1, snap["xack"])
-	require.EqualValues(t, 0, snap["evalsha"]+snap["eval"], "no scripts without counters")
+	require.EqualValues(t, 1, snap["evalsha"]+snap["eval"], "one script call publishes (and marks a recreated stream)")
+	require.EqualValues(t, 1, snap["xack"], "a plain XACK without counters")
 	keys, err := scanAll(t.Context(), env.rdb.Client(), "{"+env.b.stream+"}:stats:*")
 	require.NoError(t, err)
 	require.Empty(t, keys)
 	require.Equal(t, Counters{}, env.counters("", 1)[0].Total)
-	require.EqualValues(t, 1, env.b.Stats().Processed, "the in-process stats work as before")
+	require.EqualValues(t, 1, env.b.Stats().Processed, "the in-process stats work without Redis counters")
 }
 
 // A broken counter (wrong type of the key) must neither fail the publication nor leave a message unacknowledged.
@@ -233,3 +232,60 @@ func TestStats_FailureDoesNotAffectDelivery(t *testing.T) {
 }
 func TestStats_NameLimit(t *testing.T) { eachRedis(t, redisStatsNameLimit) }
 func TestSnapshot(t *testing.T)        { eachRedis(t, redisSnapshot) }
+
+// ---------------------------------------------------------------------------
+// A run of a message acknowledged by another run is a duplicate, not a second outcome
+// ---------------------------------------------------------------------------
+
+func redisDuplicateIsNotCountedTwice(t *testing.T) {
+	for _, stats := range []bool{true, false} {
+		t.Run(map[bool]string{true: "counters on", false: "counters off"}[stats], func(t *testing.T) {
+			env := newTestEnv(t, func(c *BusConfiguration) {
+				if !stats {
+					c.StatsRetention = -1
+				}
+			})
+			env.register("r", func(context.Context, *scriptReceiver) error { return nil })
+			env.add("r")
+			msg := env.deliver()
+
+			require.NoError(t, env.b.handle(t.Context(), msg, 1)) // the first run acknowledges it
+			require.NoError(t, env.b.handle(t.Context(), msg, 1)) // a second run of the same delivery
+
+			st := env.b.Stats()
+			require.EqualValues(t, 1, st.Processed)
+			require.EqualValues(t, 1, st.Duplicates)
+			if stats {
+				total := env.counters("", 1)[0].Total
+				require.EqualValues(t, 1, total.Processed, "the duplicate is not a second success")
+				require.EqualValues(t, 1, total.Received)
+				require.EqualValues(t, 1, total.Duplicates)
+				require.EqualValues(t, 1, env.counters("", 1)[0].ByReceiver["r"].Duplicates)
+			}
+		})
+	}
+}
+
+func TestDuplicate_IsNotCountedTwice(t *testing.T) { eachRedis(t, redisDuplicateIsNotCountedTwice) }
+
+// A second move of a message to the dead-letter stream (another run had moved and acknowledged it) is a duplicate
+// in the in-process stats as in the Redis counters.
+func redisDeadLetterDuplicateIsCountedOnce(t *testing.T) {
+	env := newTestEnv(t, func(c *BusConfiguration) { c.Unregistered = UnregisteredDeadLetter })
+	env.add("ghost")
+	msg := env.deliver()
+
+	require.ErrorIs(t, env.b.handle(t.Context(), msg, 1), ErrorReceiverNotRegistered)
+	require.ErrorIs(t, env.b.handle(t.Context(), msg, 1), ErrorReceiverNotRegistered)
+
+	st := env.b.Stats()
+	require.EqualValues(t, 1, st.DeadLettered)
+	require.EqualValues(t, 1, st.Duplicates)
+	total := env.counters("", 1)[0].Total
+	require.EqualValues(t, 1, total.DeadLettered, "the Redis counters agree with Stats")
+	require.EqualValues(t, 1, total.Duplicates)
+}
+
+func TestDuplicate_DeadLetterIsCountedOnce(t *testing.T) {
+	eachRedis(t, redisDeadLetterDuplicateIsCountedOnce)
+}

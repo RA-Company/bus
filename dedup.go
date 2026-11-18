@@ -3,7 +3,7 @@ package bus
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
+	"errors"
 	"time"
 )
 
@@ -12,7 +12,7 @@ const defaultDedupTTL = 10 * time.Minute
 
 // ErrorDedupStreamName is returned by AddMessage with a dedup key when the stream name contains braces
 // in a way that does not form a Redis Cluster hash tag, so a key in the same slot cannot be built.
-var ErrorDedupStreamName = fmt.Errorf("stream name with braces cannot be used with deduplication")
+var ErrorDedupStreamName = errors.New("stream name with braces cannot be used with deduplication")
 
 // dedupKeyName builds the Redis key of a dedup entry. The part in braces is the hash tag of the stream
 // (its own tag, or its whole name), so in a cluster the key lives in the stream's slot and one script

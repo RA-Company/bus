@@ -3,7 +3,7 @@ module github.com/ra-company/bus
 go 1.26.4
 
 require (
-	github.com/brianvoe/gofakeit/v7 v7.18.2
+	github.com/brianvoe/gofakeit/v7 v7.18.9
 	github.com/google/uuid v1.6.0
 	github.com/ra-company/database v1.0.18
 	github.com/ra-company/env v1.0.4

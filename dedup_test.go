@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -154,15 +155,19 @@ func redisDedupConcurrentProducers(t *testing.T) {
 	require.EqualValues(t, 1, runs.Load())
 }
 
-// StreamSize still applies to messages added with a key.
+// StreamSize still applies to messages added with a key. The trimming is approximate (whole nodes of
+// stream-node-max-entries, 100 by default), so enough messages are added to fill several nodes.
 func redisDedupKeepsStreamLimits(t *testing.T) {
-	env := newTestEnv(t, func(c *BusConfiguration) { c.StreamSize = 3 })
+	const size, added, node = 3, 350, 100
+	env := newTestEnv(t, func(c *BusConfiguration) { c.StreamSize = size })
 	env.cleanDedup()
-	for _, k := range []string{"a", "b", "c", "d", "e"} {
-		_, added := env.addKey("event", k)
-		require.True(t, added)
+	for i := range added {
+		_, ok := env.addKey("event", strconv.Itoa(i))
+		require.True(t, ok)
 	}
-	require.Len(t, env.streamIDs(), 3)
+	n := len(env.streamIDs())
+	require.GreaterOrEqual(t, n, size)
+	require.LessOrEqual(t, n, size+node, "the stream must be trimmed to about StreamSize")
 }
 
 func TestDedup_DuplicateIsNotAdded(t *testing.T) { eachRedis(t, redisDedupDuplicateIsNotAdded) }

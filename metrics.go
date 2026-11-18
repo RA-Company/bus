@@ -26,12 +26,16 @@ type Stats struct {
 	// context and hold their workers. A value that does not go back to zero is a receiver without a timeout
 	// of its own; when it reaches WorkersCount, nothing is processed.
 	Stuck int64 `json:"stuck"`
+	// Duplicates counts runs whose message had been acknowledged by another run already when this one
+	// acknowledged it (a late success after HandlerTimeout, or an at-least-once duplicate). They are not counted
+	// in Processed or DeadLettered again.
+	Duplicates int64 `json:"duplicates"`
 	// InFlight is the number of messages being executed right now.
 	InFlight int64 `json:"in_flight"`
 }
 
 type counters struct {
-	processed, retried, deadLettered, failed, ackErrors, deduplicated, timedOut atomic.Int64
+	processed, retried, deadLettered, failed, ackErrors, deduplicated, timedOut, duplicates atomic.Int64
 }
 
 // Stats returns a snapshot of the in-process counters. See Stats for what each counter means.
@@ -44,6 +48,7 @@ func (b *Bus) Stats() Stats {
 		AckErrors:    b.counters.ackErrors.Load(),
 		Deduplicated: b.counters.deduplicated.Load(),
 		TimedOut:     b.counters.timedOut.Load(),
+		Duplicates:   b.counters.duplicates.Load(),
 		Stuck:        b.stuck.Load(),
 		InFlight:     b.inFlight.Load(),
 	}

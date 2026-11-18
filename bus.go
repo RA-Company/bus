@@ -6,13 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,22 +22,26 @@ import (
 )
 
 var (
-	ErrorEmptyReceiverTitle    = fmt.Errorf("receiver title cannot be empty")
-	ErrorReceiverNotRegistered = fmt.Errorf("receiver not registered")
-	ErrorInvalidReceiverName   = fmt.Errorf("invalid receiver name")
-	ErrorEmptyTask             = fmt.Errorf("task cannot be empty")
-	ErrorEmptyGroupName        = fmt.Errorf("group name cannot be empty")
+	ErrorEmptyReceiverTitle    = errors.New("receiver title cannot be empty")
+	ErrorReceiverNotRegistered = errors.New("receiver not registered")
+	ErrorInvalidReceiverName   = errors.New("invalid receiver name")
+	ErrorEmptyTask             = errors.New("task cannot be empty")
+	ErrorEmptyGroupName        = errors.New("group name cannot be empty")
+	ErrorNilConfiguration      = errors.New("bus configuration cannot be nil")
+	ErrorAlreadyInitialized    = errors.New("bus is already initialized")
+	ErrorNotInitialized        = errors.New("bus is not initialized, call Init first")
 	// ErrorStopTimeout is returned by Stop and Close when running receivers did not finish before the
 	// context expired. Their messages were not acknowledged, so they stay pending and are redelivered.
-	ErrorStopTimeout = fmt.Errorf("bus did not stop in time")
-	// ErrorHandlerTimeout is the error of an execution that ran longer than BusConfiguration.HandlerTimeout.
-	// It is an ordinary failure: the message stays pending and is retried (or dead-lettered when its retries
+	ErrorStopTimeout = errors.New("bus did not stop in time")
+	// ErrorHandlerTimeout is the error of an execution that ran longer than BusConfiguration.HandlerTimeout
+	// and then failed (one that returns nil late is a success). It is an ordinary failure: the message stays pending and is retried (or dead-lettered when its retries
 	// are exhausted). It is also the cause of the cancelled context the receiver sees.
-	ErrorHandlerTimeout = fmt.Errorf("receiver did not finish in time")
+	ErrorHandlerTimeout = errors.New("receiver did not finish in time")
 )
 
-const retryFailed = math.MaxInt // A large number to indicate that a message should not be retried anymore
-
+// Bus is a message bus on a Redis stream: producers publish messages with AddMessage, and the workers started by
+// Start deliver them to the receivers registered for them, at least once, within one consumer group. Initialise it
+// with Init; the zero value can only be stopped.
 type Bus struct {
 	logging.CustomLogger
 	redis            *redis.RedisClient
@@ -55,13 +55,15 @@ type Bus struct {
 	mu               sync.RWMutex               // Mutex to protect access to the receivers map
 	inFlight         atomic.Int64               // Counter for the number of messages currently being processed
 	showUnregistered bool                       // Whether to show warnings for unregistered receivers
+	unregistered     UnregisteredPolicy         // What to do with messages for unregistered receivers
 	options          map[string]ReceiverOptions // Per-receiver options by name (guarded by mu)
 	deadStream       string                     // Dead-letter stream name (default: <stream>:dead)
 	deadSize         int64                      // Maximum number of entries in the dead-letter stream (default: 10000)
 	deadRetention    time.Duration              // How long dead-letter entries are kept (default: 30 days)
 	counters         counters                   // In-process counters, see Stats
 
-	dedupTTL time.Duration // How long a dedup key is remembered (default: 10 minutes)
+	dedupTTL   time.Duration // How long a dedup key is remembered (default: 10 minutes)
+	rebirthTTL time.Duration // How long the mark of a recreated stream is kept; 0 = no mark (see rebirth.go)
 
 	handlerTimeout time.Duration // Longest run of one receiver; 0 = unlimited (default: 10 x RetryIdleTime)
 	stuck          atomic.Int64  // Receivers running past their HandlerTimeout right now
@@ -82,8 +84,16 @@ type Bus struct {
 	claimEvery time.Duration // Minimum interval between two searches for idle messages while nothing is idle
 	lastClaim  atomic.Int64  // Unix nanoseconds of the last search for idle messages
 
+	logger logging.Logger // Logger set by SetLogger, applied to the Redis client created later by Init
+
+	readBackoff time.Duration // Pause of a worker after a failed read or claim (default: 5 seconds)
+
 	shutdownTimeout time.Duration // How long Start waits for running receivers after ctx is cancelled
+	lifeOnce        sync.Once     // Creates stopCh, allDone and forced, see initLifecycle
 	lc              sync.Mutex    // Guards stopped, execCancel and the workers WaitGroup counter
+	initialized     atomic.Bool   // Init has succeeded; read without a lock on every AddMessage, written under lc
+	initializing    bool          // Init is running; a concurrent Init returns ErrorAlreadyInitialized (guarded by lc)
+	started         bool          // Start has launched the workers; a second Start does nothing
 	stopped         bool          // Stop (or the end of Start) has begun, no new workers may start
 	execCancel      context.CancelFunc
 	stopOnce        sync.Once
@@ -96,15 +106,25 @@ type Bus struct {
 	forced          chan struct{} // Closed when waiting for receivers was given up and their contexts cancelled
 }
 
+// BusConfiguration is the configuration passed to Init. Zero values mean the documented defaults.
 type BusConfiguration struct {
-	Redis            redis.Config // Configuration for Redis connection
-	Stream           string       // Stream name for the bus
-	Group            string       // Consumer group name
-	WorkersCount     int64        // Number of workers to process tasks
-	NumRetries       int64        // Number of retries for failed tasks
-	StreamSize       int64        // Maximum size of the stream
-	RetryIdleTime    int64        // How long a worker may be silent before its message is retried (in seconds); a running receiver renews it, see lease.go
-	ShowUnregistered bool         // Whether to show warnings for unregistered receivers
+	Redis        redis.Config // Configuration for Redis connection
+	Stream       string       // Stream name for the bus
+	Group        string       // Consumer group name
+	WorkersCount int64        // Number of workers to process tasks
+	NumRetries   int64        // Number of retries for failed tasks
+	// StreamSize is the size the stream is trimmed to on every AddMessage (default 10000). The trimming is
+	// approximate (XADD MAXLEN ~): Redis removes whole nodes, so the stream may hold up to about a hundred
+	// entries more, and trimming stays cheap. The oldest entries go first, processed or not.
+	StreamSize       int64
+	RetryIdleTime    int64 // How long a worker may be silent before its message is retried (in seconds); a running receiver renews it, see lease.go
+	ShowUnregistered bool  // Whether to show warnings for unregistered receivers
+
+	// Unregistered decides what happens to a message whose receiver is not registered in this process.
+	// Default UnregisteredAck: acknowledged and ignored, right for a group whose instances all run the same
+	// code. During a rolling deploy that adds a receiver, old instances would drop its messages: use
+	// UnregisteredLeave there. See UnregisteredPolicy.
+	Unregistered UnregisteredPolicy
 
 	// DeadLetterStream is the stream that receives messages the bus gave up on (retries exhausted
 	// or a receiver returned Permanent). Default: "<Stream>:dead".
@@ -116,6 +136,12 @@ type BusConfiguration struct {
 	// Default: 30 days.
 	DeadLetterRetention time.Duration
 
+	// StreamRebirthTTL is how long the mark of a recreated stream is kept (see rebirth.go). When the stream key is
+	// deleted and created anew, the groups that notice it within this time start at the beginning of the new
+	// stream and lose nothing; one that notices later starts at its end. Keep it longer than the longest time a
+	// service may be down. Default: 1 hour; a negative value switches the mark off.
+	StreamRebirthTTL time.Duration
+
 	// DedupTTL is how long a deduplication key passed to AddMessage is remembered, counted from the
 	// first publication with it. It must cover the longest delay between duplicates; a shorter
 	// time means fewer keys in Redis. Default: 10 minutes. It has no effect without a key.
@@ -123,20 +149,20 @@ type BusConfiguration struct {
 
 	// StatsRetention is how long the daily counters (published, received, processed, failed, dead-lettered,
 	// ignored; see Counters) are kept in Redis. Default: 30 days. A negative value switches the counters
-	// off: the bus then sends plain XADD and XACK, as before the counters existed.
+	// off: the bus then acknowledges with a plain XACK.
 	StatsRetention time.Duration
 
 	// ShutdownTimeout is how long Start waits for running receivers after its context is cancelled
 	// (or SIGINT/SIGTERM arrives): no new messages are read, receivers keep running with an
 	// uncancelled context, and when the time is up their context is cancelled and Start returns.
-	// Zero (default) keeps the old behaviour: the receivers' context is cancelled at once and Start
+	// Zero (default) is a hard stop: the receivers' context is cancelled at once and Start
 	// waits for them to return. Stop(ctx) does not depend on this setting.
 	ShutdownTimeout time.Duration
 
 	// HandlerTimeout is the longest time one receiver may run for one message. When it is up the receiver's
-	// context is cancelled (cause ErrorHandlerTimeout) and, whenever the receiver returns, the run counts as a
-	// failure with ErrorHandlerTimeout, even if it returns nil: the message is retried like after any other
-	// failure. The receiver runs in the worker's own goroutine, so there are never more running receivers
+	// context is cancelled (cause ErrorHandlerTimeout). If the receiver then returns an error, the run fails with
+	// ErrorHandlerTimeout and the message is retried like after any other failure; if it returns nil, the work
+	// is done and the message is acknowledged, only late. The receiver runs in the worker's own goroutine, so there are never more running receivers
 	// than WorkersCount. Go cannot kill a goroutine: a receiver that ignores its context keeps its worker
 	// until it returns (see Stats.Stuck), instead of leaving a goroutine and its connections behind.
 	//
@@ -146,6 +172,37 @@ type BusConfiguration struct {
 	// means 10 x RetryIdleTime, a negative value switches the limit off: then a receiver that hangs and ignores
 	// its context holds its worker and its message for ever.
 	HandlerTimeout time.Duration
+}
+
+// UnregisteredPolicy is what the bus does with a message whose receiver is not registered in this process,
+// see BusConfiguration.Unregistered.
+type UnregisteredPolicy int
+
+const (
+	// UnregisteredAck acknowledges the message and ignores it (default). It suits a group whose instances all
+	// handle the same receivers. A message for a receiver that only a newer version of the service has is lost
+	// for the group if an older instance reads it.
+	UnregisteredAck UnregisteredPolicy = iota
+	// UnregisteredLeave leaves the message pending without executing it. After RetryIdleTime it is redelivered,
+	// possibly to an instance that has the receiver (a newer version during a rolling deploy). If nobody handles it
+	// within NumRetries deliveries it goes to the dead-letter stream with reason DeadReasonUnregistered.
+	// Nothing is lost, at the cost of a delay of up to RetryIdleTime per delivery.
+	UnregisteredLeave
+	// UnregisteredDeadLetter moves the message to the dead-letter stream at once (reason DeadReasonUnregistered).
+	UnregisteredDeadLetter
+)
+
+// String returns the name of the policy.
+func (p UnregisteredPolicy) String() string {
+	switch p {
+	case UnregisteredAck:
+		return "ack"
+	case UnregisteredLeave:
+		return "leave"
+	case UnregisteredDeadLetter:
+		return "dead-letter"
+	}
+	return fmt.Sprintf("UnregisteredPolicy(%d)", int(p))
 }
 
 // ReceiverOptions are optional per-receiver settings, see RegisterReceiverWithOptions.
@@ -161,25 +218,101 @@ type ReceiverOptions struct {
 //
 // Parameters:
 //   - logger: An instance of a type that implements the logging.Logger interface.
+//
+// It may be called before Init: the logger is then applied to the Redis client when Init creates it.
 func (b *Bus) SetLogger(logger logging.Logger) {
+	b.logger = logger
 	b.CustomLogger.SetLogger(logger)
-	b.redis.SetLogger(logger)
+	if b.redis != nil {
+		b.redis.SetLogger(logger)
+	}
+}
+
+// initLifecycle creates the channels that drive stopping. It runs once, from Init or from the first call
+// of Start, Stop or Close, so that a bus that was never initialised can still be stopped without a panic.
+func (b *Bus) initLifecycle() {
+	b.lifeOnce.Do(func() {
+		b.stopCh = make(chan struct{})
+		b.allDone = make(chan struct{})
+		b.forced = make(chan struct{})
+	})
+}
+
+// defaultReadBackoff is how long a worker pauses after a failed read or claim, so that an unreachable Redis
+// does not turn the workers into a busy loop.
+const defaultReadBackoff = 5 * time.Second
+
+// pause waits for the read backoff, or less if the bus is stopping.
+func (b *Bus) pause(ctx context.Context) {
+	d := b.readBackoff
+	if d <= 0 {
+		d = defaultReadBackoff
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-b.stopCh:
+	case <-ctx.Done():
+	}
 }
 
 // Init initializes the bus with the provided configuration.
 // It sets up the Redis client, stream, group, and workers count.
 // If the stream or group is not provided, it defaults to "default-stream" and "default-group".
 // It also creates the Redis stream group if it does not already exist.
+// Init is called once: a second call after a successful one, or while another Init runs, returns
+// ErrorAlreadyInitialized and changes nothing. After a failed Init (for example Redis is unreachable) its Redis
+// connection is closed and it can be called again. Receivers registered before Init are kept.
 //
 // Parameters:
 //   - ctx: The context for the operation.
 //   - config: The configuration for the bus, including Redis connection details, stream name, group name, workers count, and number of retries.
-func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
-	b.receivers = make(map[string]ReceiverFactory)
-	b.options = make(map[string]ReceiverOptions)
+func (b *Bus) Init(ctx context.Context, config *BusConfiguration) (err error) {
+	if config == nil {
+		return ErrorNilConfiguration
+	}
+	// The check and the claim are one step, so two concurrent calls cannot both initialise the bus.
+	b.lc.Lock()
+	if b.initialized.Load() || b.initializing {
+		b.lc.Unlock()
+		// A second Init would replace the Redis client and the configuration under running code.
+		return ErrorAlreadyInitialized
+	}
+	b.initializing = true
+	b.lc.Unlock()
+	defer func() {
+		if err != nil {
+			// A later Init creates a new connection: do not leave this one open.
+			err = errors.Join(err, b.closeRedis())
+		}
+		b.lc.Lock()
+		b.initializing = false
+		b.initialized.Store(err == nil)
+		b.lc.Unlock()
+	}()
+
+	b.mu.Lock()
+	if b.receivers == nil { // RegisterReceiver may have been called before Init
+		b.receivers = make(map[string]ReceiverFactory)
+	}
+	if b.options == nil {
+		b.options = make(map[string]ReceiverOptions)
+	}
+	b.mu.Unlock()
 	b.redis = &redis.RedisClient{}
+	if b.logger != nil {
+		b.redis.SetLogger(b.logger)
+	}
 	b.redis.Start(ctx, &config.Redis)
 	b.showUnregistered = config.ShowUnregistered
+	switch config.Unregistered {
+	case UnregisteredAck, UnregisteredLeave, UnregisteredDeadLetter:
+		b.unregistered = config.Unregistered
+	default:
+		b.Warnf(ctx, "Unknown policy for unregistered receivers %v, using %v", config.Unregistered, UnregisteredAck)
+		b.unregistered = UnregisteredAck
+	}
 
 	b.stream = config.Stream
 	if b.stream == "" {
@@ -249,6 +382,13 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 	} else if config.StatsRetention >= 0 {
 		b.Warnf(ctx, "Counters are off: stream name %q does not allow keys in the stream's hash slot", b.stream)
 	}
+	switch {
+	case config.StreamRebirthTTL < 0:
+	case config.StreamRebirthTTL == 0:
+		b.rebirthTTL = defaultStreamRebirthTTL
+	default:
+		b.rebirthTTL = config.StreamRebirthTTL
+	}
 	b.dedupTTL = config.DedupTTL
 	if b.dedupTTL <= 0 {
 		b.dedupTTL = defaultDedupTTL
@@ -263,14 +403,39 @@ func (b *Bus) Init(ctx context.Context, config *BusConfiguration) error {
 	b.aliveTTL = defaultAliveTTL
 	b.purgeIdle = defaultPurgeIdle
 
-	b.stopCh = make(chan struct{})
-	b.allDone = make(chan struct{})
-	b.forced = make(chan struct{})
+	b.initLifecycle()
 
-	err := b.redis.XGroupCreateMkStream(ctx, b.stream, b.group, "$")
-	if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
-		b.Errorf(ctx, "Failed to create group %s for stream %s: %v", b.group, b.stream, err)
+	// The group starts at the end of the stream, or at its beginning when the stream is new or was recreated
+	// recently (see rebirth.go).
+	if _, _, err = b.createGroup(ctx, b.group, "$"); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ready returns ErrorNotInitialized unless Init has succeeded. Every public method that talks to Redis checks it,
+// so a bus used before Init (or after a failed one) returns an error instead of panicking on a nil client.
+func (b *Bus) ready() error {
+	if !b.initialized.Load() {
+		return ErrorNotInitialized
+	}
+	return nil
+}
+
+// closeRedis closes the Redis connection of the bus. It does nothing without one. The client is kept, so a
+// call after it fails with a closed-connection error instead of a nil pointer.
+func (b *Bus) closeRedis() error {
+	if b.redis == nil {
+		return nil
+	}
+	closer, ok := b.redis.Client().(io.Closer)
+	if !ok {
+		return nil
+	}
+	// A connection closed already (by a failed Init) is not an error: a cluster client does not report it
+	// either, so Close behaves the same on a single node and on a cluster.
+	if err := closer.Close(); err != nil && !errors.Is(err, re.ErrClosed) {
+		return fmt.Errorf("close Redis connection: %w", err)
 	}
 	return nil
 }
@@ -333,15 +498,17 @@ func (b *Bus) Subscribe(ctx context.Context, title string, receiver ReceiverFact
 // the stream too. A group is created at position "0", so it receives every message that is in the
 // stream, including messages a producer added before the consuming service started for the first
 // time. Existing groups are left untouched. Call it on the producing side for every service that
-// must not miss events; Init creates only the bus' own group, at the end of the stream ("$").
+// must not miss events; Init creates only the bus' own group, at the end of the stream ("$"). A stream it
+// creates is marked as new, see rebirth.go.
 func (b *Bus) EnsureGroups(ctx context.Context, groups ...string) error {
+	if err := b.ready(); err != nil {
+		return err
+	}
 	for _, group := range groups {
 		if group == "" {
 			return ErrorEmptyGroupName
 		}
-		err := b.redis.XGroupCreateMkStream(ctx, b.stream, group, "0")
-		if err != nil && !errors.Is(err, redis.ErrorGroupAlreadyExists) {
-			b.Errorf(ctx, "Failed to ensure group %s for stream %s: %v", group, b.stream, err)
+		if _, _, err := b.createGroup(ctx, group, "0"); err != nil {
 			return fmt.Errorf("ensure group %q: %w", group, err)
 		}
 	}
@@ -401,12 +568,18 @@ func (b *Bus) ReceiversCount() int {
 // When ctx is cancelled, the workers stop reading new messages. With BusConfiguration.ShutdownTimeout
 // set, receivers that are already running get that long to finish with an uncancelled context;
 // otherwise (the default) their context is cancelled at once. Either way a message whose receiver did
-// not succeed is not acknowledged and stays pending. Start can be used only once: after Stop it
-// returns immediately.
+// not succeed is not acknowledged and stays pending. Start can be used only once: after Stop, while the bus
+// is already running, or without a successful Init it returns immediately (the last case is logged as an error).
 //
 // Parameters:
 //   - ctx: The context for the operation, used for cancellation and timeout.
 func (b *Bus) Start(ctx context.Context) {
+	b.initLifecycle()
+	if err := b.ready(); err != nil {
+		b.Errorf(ctx, "Bus cannot start: %v", err)
+		return
+	}
+
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -421,6 +594,12 @@ func (b *Bus) Start(ctx context.Context) {
 		b.Info(ctx, "Bus is already stopped, nothing to start")
 		return
 	}
+	if b.started {
+		b.lc.Unlock()
+		b.Warn(ctx, "Bus is already started, the second Start does nothing")
+		return
+	}
+	b.started = true
 	b.execCancel = execCancel
 	b.workers.Add(int(b.workersCount))
 	heartbeatDone := make(chan struct{}) // closed when the heartbeat and the lease renewal have finished
@@ -446,6 +625,8 @@ func (b *Bus) Start(ctx context.Context) {
 
 	select {
 	case <-ctx.Done():
+		// Give the signals back: a second SIGINT/SIGTERM during the graceful wait now kills the process.
+		stop()
 		b.Info(ctx, "Bus is stopping, waiting for workers to finish")
 		if b.shutdownTimeout > 0 {
 			stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), b.shutdownTimeout)
@@ -475,6 +656,7 @@ func (b *Bus) Start(ctx context.Context) {
 
 // beginStop makes workers stop reading new messages; running receivers are not touched.
 func (b *Bus) beginStop() {
+	b.initLifecycle()
 	b.stopOnce.Do(func() {
 		b.lc.Lock()
 		b.stopped = true
@@ -489,6 +671,7 @@ func (b *Bus) beginStop() {
 
 // forceStop cancels the context of running receivers and the reads of the workers.
 func (b *Bus) forceStop() {
+	b.initLifecycle()
 	b.forceOnce.Do(func() {
 		b.lc.Lock()
 		cancel := b.execCancel
@@ -573,11 +756,8 @@ func (b *Bus) Close(ctx context.Context) error {
 	}
 	b.waitHeartbeat(wctx)
 	b.closeOnce.Do(func() {
-		if closer, ok := b.redis.Client().(io.Closer); ok {
-			if cerr := closer.Close(); cerr != nil {
-				b.Errorf(ctx, "Failed to close Redis connection: %v", cerr)
-				err = errors.Join(err, cerr)
-			}
+		if cerr := b.closeRedis(); cerr != nil {
+			err = errors.Join(err, cerr)
 		}
 	})
 	return err
@@ -602,6 +782,9 @@ func (b *Bus) Close(ctx context.Context) error {
 //   - string: The id of the message (of the first one for a duplicate).
 //   - error: An error if the receiver title is empty or if adding the receiver to the stream fails.
 func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any, dedupKey string) (string, error) {
+	if err := b.ready(); err != nil {
+		return "", err
+	}
 	if receiver == "" {
 		return "", ErrorEmptyReceiverTitle
 	}
@@ -614,7 +797,8 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any, dedu
 	id := uuid.New().String()
 	stamp := time.Now().UTC().Format(time.RFC3339Nano) // Current time in RFC3339Nano format
 
-	if dedupKey == "" && !b.statsOn() {
+	if b.tag == "" && dedupKey == "" {
+		// No key can share the stream's slot: no counters and no mark of a recreated stream, a plain XADD.
 		_, err = b.redis.XAdd(ctx, &re.XAddArgs{
 			Stream: b.stream,
 			Values: map[string]any{
@@ -623,10 +807,11 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any, dedu
 				"payload":  string(data), // Serialized payload
 				"time":     stamp,
 			},
-			MaxLen: int64(b.streamSize), // Limit the stream size
+			MaxLen: b.streamSize, // Limit the stream size, see BusConfiguration.StreamSize
+			Approx: true,
 		})
 	} else {
-		// XADD, the deduplication check and the "published" counters in one call.
+		// XADD, the deduplication check, the "published" counters and the mark of a recreated stream in one call.
 		var added bool
 		var first string
 		first, added, err = b.publish(ctx, receiver, string(data), id, stamp, dedupKey)
@@ -637,8 +822,7 @@ func (b *Bus) AddMessage(ctx context.Context, receiver string, payload any, dedu
 		}
 	}
 	if err != nil {
-		b.Errorf(ctx, "b.redis.XAdd() error: %v", err)
-		return "", err
+		return "", fmt.Errorf("add message %q to stream %q: %w", receiver, b.stream, err)
 	}
 
 	b.Infof(ctx, "Message %q added to stream %q with ID %q", receiver, b.stream, id)
@@ -672,6 +856,7 @@ func (b *Bus) safeWorker(ctx context.Context, worker string) {
 				defer func() {
 					if r := recover(); r != nil {
 						b.Errorf(ctx, "[worker %q] panic recovered: %v \033[1m \033[31m%s\033[0m", worker, r, strings.ReplaceAll(string(debug.Stack()), "\n", " "))
+						b.pause(ctx) // a panic that repeats on every step must not become a busy loop
 					}
 				}()
 
@@ -699,12 +884,10 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		msg, deliveries, found, err := b.claimIdle(ctx, worker)
 		if err != nil {
 			b.Errorf(ctx, "Failed to claim an idle message: %v", err)
-			// Wait before retrying and check for stop to avoid a tight loop on errors
-			select {
-			case <-time.After(5 * time.Second):
-			case <-b.stopCh:
-			case <-ctx.Done():
+			if isNoGroup(err) {
+				b.recreateGroup(ctx)
 			}
+			b.pause(ctx) // avoid a tight loop on errors
 			return
 		}
 
@@ -726,7 +909,14 @@ func (b *Bus) workerJob(ctx context.Context, worker string) {
 		Count:    1,
 	})
 	if err != nil {
+		if ctx.Err() != nil || errors.Is(err, re.Nil) {
+			return // stopping, or nothing arrived
+		}
 		b.Errorf(ctx, "Failed to read from stream %s: %v", b.stream, err)
+		if isNoGroup(err) {
+			b.recreateGroup(ctx)
+		}
+		b.pause(ctx) // an unreachable Redis must not turn the workers into a busy loop
 		return
 	}
 
@@ -822,18 +1012,19 @@ func (b *Bus) claimDue() bool {
 	return now-last >= int64(b.claimEvery) && b.lastClaim.CompareAndSwap(last, now)
 }
 
-// logProcessError logs a processMessage failure. Messages for unregistered receivers are
-// acknowledged and ignored by design, so they are not reported as errors.
+// logProcessError is the one place where a failed message is logged, with its stream id and message id; the
+// code below returns errors instead of logging them. A message for an unregistered receiver is normal and is
+// not reported, unless something failed with it (for example its acknowledgement), which wraps the sentinel.
 func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
-	if err == nil || errors.Is(err, ErrorReceiverNotRegistered) {
+	if err == nil || err == ErrorReceiverNotRegistered { //nolint:errorlint // identity on purpose: a wrapped one carries a failure
 		return
 	}
 	b.Errorf(ctx, "Failed to process message %q (stream id %q, message id %q): %v", msg.Values["receiver"], msg.ID, msg.Values["id"], err)
 }
 
-// processMessage processes a message by starting the associated receiver, executing it, and finishing it.
-// It retrieves the receiver name from the message, checks if the receiver is registered,
-// and if so, it starts the receiver, executes it, and finishes it.
+// handle processes a message by starting the associated receiver, executing it, and finishing it.
+// knownDeliveries is the delivery counter when the caller knows it (the worker passes 1 for a message it has
+// just read with XREADGROUP, and the counter from XCLAIM for a claimed one); 0 means it is read from Redis.
 //
 // Delivery is "at least once": the message is acknowledged only after the receiver has succeeded.
 // If the receiver fails (or panics), the message stays pending in the consumer group and is
@@ -849,24 +1040,14 @@ func (b *Bus) logProcessError(ctx context.Context, msg re.XMessage, err error) {
 // neither executed nor acknowledged: an error is returned and the message stays pending, so it is
 // redelivered later instead of being lost. The same holds when the dead-letter write fails.
 //
-// Parameters:
-//   - ctx: The context for the operation.
-//   - msg: The message containing the receiver data, which should include the receiver title and other necessary information.
-//
-// Returns:
-//   - error: An error if the receiver fails to start or execute, or if the message could not be
-//     acknowledged, moved to the dead-letter stream or its delivery counter could not be read, otherwise nil.
-func (b *Bus) processMessage(ctx context.Context, msg re.XMessage) error {
-	return b.handle(ctx, msg, 0)
-}
-
-// handle is processMessage with an optional known delivery counter: a positive value is used instead
-// of asking Redis (the worker passes 1 for a message it has just read with XREADGROUP).
+// It returns an error if the receiver fails to start or execute, or if the message could not be
+// acknowledged, moved to the dead-letter stream or its delivery counter could not be read.
 func (b *Bus) handle(ctx context.Context, msg re.XMessage, knownDeliveries int64) error {
 	receiverName, ok := msg.Values["receiver"].(string)
 	if !ok {
-		b.Errorf(ctx, "Message %q does not contain a valid receiver name", msg.ID)
-		_ = b.ack(ctx, msg, kindInvalid) // failure is logged inside
+		if _, err := b.ack(ctx, msg, kindInvalid); err != nil {
+			return fmt.Errorf("%w: %w", ErrorInvalidReceiverName, err)
+		}
 		return ErrorInvalidReceiverName
 	}
 
@@ -875,27 +1056,12 @@ func (b *Bus) handle(ctx context.Context, msg re.XMessage, knownDeliveries int64
 	opts := b.options[receiverName]
 	b.mu.RUnlock()
 	if !ok {
-		// A consumer group sees the whole stream, so events this service has not subscribed to
-		// are normal: they are acknowledged and ignored.
-		if b.showUnregistered {
-			b.Warnf(ctx, "Receiver %q is not registered", receiverName)
-		}
-		_ = b.ack(ctx, msg, kindUnregistered) // failure is logged inside
-		return ErrorReceiverNotRegistered
+		return b.handleUnregistered(ctx, msg, receiverName, knownDeliveries)
 	}
 
-	deliveries, pending, err := knownDeliveries, true, error(nil)
-	if knownDeliveries <= 0 {
-		deliveries, pending, err = b.deliveryCount(ctx, msg.ID)
-	}
-	if err != nil {
-		b.Errorf(ctx, "Failed to read delivery count of message %q, leaving it pending for redelivery: %v", msg.ID, err)
-		return fmt.Errorf("read delivery count of message %s: %w", msg.ID, err)
-	}
-	if !pending {
-		// Somebody else has already acknowledged (or the stream has trimmed) this message.
-		b.Warnf(ctx, "Message %q is no longer pending, skipping", msg.ID)
-		return nil
+	deliveries, pending, err := b.deliveries(ctx, msg, knownDeliveries)
+	if err != nil || !pending {
+		return err
 	}
 
 	limit := b.numRetries
@@ -918,7 +1084,8 @@ func (b *Bus) handle(ctx context.Context, msg re.XMessage, knownDeliveries int64
 		b.counters.failed.Add(1)
 
 		if IsPermanent(err) {
-			b.Errorf(ctx, "Receiver %q failed permanently, message %q is not retried: %v", receiverName, msg.ID, err)
+			// The error itself is logged by the worker (logProcessError); here only what happens to the message.
+			b.Warnf(ctx, "Receiver %q failed permanently, message %q is moved to the dead-letter stream", receiverName, msg.ID)
 			// The failed execution is counted together with the move to the dead-letter stream.
 			if derr := b.discard(ctx, msg, DeadReasonPermanent, err.Error(), deliveries, retriedIf(deliveries, kindFailed)...); derr != nil {
 				return errors.Join(err, derr)
@@ -929,19 +1096,98 @@ func (b *Bus) handle(ctx context.Context, msg re.XMessage, knownDeliveries int64
 		return err
 	}
 
-	if err = b.ack(ctx, msg, retriedIf(deliveries, kindProcessed)...); err != nil {
+	acked, err := b.ack(ctx, msg, retriedIf(deliveries, kindProcessed)...)
+	if err != nil {
 		return err
+	}
+	if !acked {
+		// Another run of the message (redelivered after HandlerTimeout, or an at-least-once duplicate) has
+		// acknowledged it already: this success is not counted again.
+		b.counters.duplicates.Add(1)
+		b.Infof(ctx, "Message %q had been acknowledged by another run already", msg.ID)
+		return nil
 	}
 	b.counters.processed.Add(1)
 
 	return nil
 }
 
+// deliveries returns the delivery counter of msg: knownDeliveries when positive, else read from Redis.
+// pending is false (with a nil error) when the message is no longer pending; a read failure is returned as
+// an error, and the message is then left pending for redelivery.
+func (b *Bus) deliveries(ctx context.Context, msg re.XMessage, knownDeliveries int64) (deliveries int64, pending bool, err error) {
+	if knownDeliveries > 0 {
+		return knownDeliveries, true, nil
+	}
+	deliveries, pending, err = b.deliveryCount(ctx, msg.ID)
+	if err != nil {
+		return 0, false, fmt.Errorf("read delivery count of message %s, it stays pending for redelivery: %w", msg.ID, err)
+	}
+	if !pending {
+		// Somebody else has already acknowledged (or the stream has trimmed) this message.
+		b.Warnf(ctx, "Message %q is no longer pending, skipping", msg.ID)
+	}
+	return deliveries, pending, nil
+}
+
+// handleUnregistered applies the UnregisteredPolicy to a message whose receiver is not registered here. It
+// returns ErrorReceiverNotRegistered (not logged as an error by the worker) unless something failed in Redis.
+func (b *Bus) handleUnregistered(ctx context.Context, msg re.XMessage, receiverName string, knownDeliveries int64) error {
+	if b.showUnregistered {
+		b.Warnf(ctx, "Receiver %q is not registered, policy %v", receiverName, b.unregistered)
+	}
+
+	switch b.unregistered {
+	case UnregisteredLeave:
+		deliveries, pending, err := b.deliveries(ctx, msg, knownDeliveries)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			return ErrorReceiverNotRegistered
+		}
+		if deliveries > b.numRetries {
+			b.Warnf(ctx, "Message %q for unregistered receiver %q was not handled in %d deliveries, moving it to the dead-letter stream", msg.ID, receiverName, deliveries)
+			if err := b.discard(ctx, msg, DeadReasonUnregistered,
+				fmt.Sprintf("receiver %q is not registered in any instance that read it (%d deliveries)", receiverName, deliveries),
+				deliveries, kindUnregistered); err != nil {
+				return err
+			}
+			return ErrorReceiverNotRegistered
+		}
+		// Not acknowledged: after RetryIdleTime another instance (one that has the receiver) may take it.
+		b.recordFailure(ctx, msg, kindUnregistered)
+		return ErrorReceiverNotRegistered
+
+	case UnregisteredDeadLetter:
+		deliveries, pending, err := b.deliveries(ctx, msg, knownDeliveries)
+		if err != nil {
+			return err
+		}
+		if !pending {
+			return ErrorReceiverNotRegistered
+		}
+		if err := b.discard(ctx, msg, DeadReasonUnregistered,
+			fmt.Sprintf("receiver %q is not registered", receiverName), deliveries, kindUnregistered); err != nil {
+			return err
+		}
+		return ErrorReceiverNotRegistered
+
+	default: // UnregisteredAck
+		// A consumer group sees the whole stream, so events this service has not subscribed to
+		// are normal: they are acknowledged and ignored.
+		if _, err := b.ack(ctx, msg, kindUnregistered); err != nil {
+			return fmt.Errorf("%w: %w", ErrorReceiverNotRegistered, err)
+		}
+		return ErrorReceiverNotRegistered
+	}
+}
+
 // executeLimited is execute with the HandlerTimeout. The receiver runs in the worker's own goroutine, so the
 // number of receivers running at once never exceeds WorkersCount, whatever they do. When the time is up its
 // context is cancelled (cause ErrorHandlerTimeout) and the run is counted as timed out at once; a run that
-// has exceeded the limit is a failure when the receiver returns, even if it returns nil: the message stays
-// pending and is retried. A receiver that ignores its context cannot be killed in Go, so it keeps its
+// has exceeded the limit and returns an error fails with ErrorHandlerTimeout and is retried; one that returns nil
+// late has done its work, so the message is acknowledged. A receiver that ignores its context cannot be killed in Go, so it keeps its
 // worker until it returns; Stats.Stuck shows how many such runs there are right now.
 // If ctx itself is cancelled (shutdown), it is not a timeout.
 func (b *Bus) executeLimited(ctx context.Context, receiver ReceiverInterface, msg re.XMessage) error {
@@ -959,7 +1205,8 @@ func (b *Bus) executeLimited(ctx context.Context, receiver ReceiverInterface, ms
 			b.counters.timedOut.Add(1)
 			b.stuck.Add(1)
 			b.leaseEnd(workerOf(ctx), msg.ID) // a receiver past its limit does not keep the message from being redelivered
-			b.Errorf(ctx, "Receiver %q did not finish message %q within %s, its context is cancelled", msg.Values["receiver"], msg.ID, b.handlerTimeout)
+			// A warning: the failure itself is logged once, when the receiver returns.
+			b.Warnf(ctx, "Receiver %q did not finish message %q within %s, its context is cancelled", msg.Values["receiver"], msg.ID, b.handlerTimeout)
 		}
 	})
 
@@ -973,10 +1220,13 @@ func (b *Bus) executeLimited(ctx context.Context, receiver ReceiverInterface, ms
 		return err // ctx was cancelled by the bus shutting down
 	}
 	b.stuck.Add(-1)
-	if err != nil {
-		return fmt.Errorf("%w: receiver %v, message %s, limit %s: %w", ErrorHandlerTimeout, msg.Values["receiver"], msg.ID, b.handlerTimeout, err)
+	if err == nil {
+		// The work is done, only late: running it again would do it twice. The message is acknowledged; if it
+		// was redelivered meanwhile, the other run is a duplicate, as with any at-least-once delivery.
+		b.Warnf(ctx, "Receiver %q finished message %q after its limit %s; it succeeded, so the message is acknowledged", msg.Values["receiver"], msg.ID, b.handlerTimeout)
+		return nil
 	}
-	return fmt.Errorf("%w: receiver %v, message %s, limit %s", ErrorHandlerTimeout, msg.Values["receiver"], msg.ID, b.handlerTimeout)
+	return fmt.Errorf("%w: receiver %v, message %s, limit %s: %w", ErrorHandlerTimeout, msg.Values["receiver"], msg.ID, b.handlerTimeout, err)
 }
 
 // execute starts the receiver, runs it and finishes it. A panic inside the receiver is recovered
@@ -991,47 +1241,46 @@ func (b *Bus) execute(ctx context.Context, receiver ReceiverInterface, msg re.XM
 		}
 	}()
 
-	receiver.SetBusContext(&b.inFlight, b.workersCount)
+	// Errors are not logged here: the worker logs every failed message once, in logProcessError,
+	// together with its stream id and message id.
+	if bb, ok := receiver.(busBinder); ok { // every receiver that embeds Receiver
+		bb.bindBus(receiver, b.inFlight.Load, b.workersCount)
+	}
 	ctx, err = receiver.Start(ctx, msg.Values)
 	if err != nil {
-		b.Errorf(ctx, "Failed to start receiver %q: %v", msg.Values["receiver"], err)
-		return err
+		return fmt.Errorf("start receiver: %w", err)
 	}
+	defer receiver.Finish(ctx) // also after a panic in Execute
 
-	err = receiver.Execute(ctx)
-	if err != nil {
-		b.Errorf(ctx, "Failed to execute receiver %q: %v", msg.Values["receiver"], err)
-		receiver.Finish(ctx)
-		return err
-	}
-	receiver.Finish(ctx)
-	return nil
+	return receiver.Execute(ctx)
 }
 
 // ackTimeout limits how long an acknowledgement or a dead-letter write may take.
 const ackTimeout = 5 * time.Second
 
 // ack acknowledges a message in the consumer group and counts the outcome (kinds, see stats.go) in the
-// same call. A failure is logged together with the message id, counted and returned: the message then
-// stays pending and will be redelivered.
+// same call. A failure is counted and returned (the worker logs it): the message then stays pending and
+// will be redelivered.
 // The acknowledgement deliberately ignores cancellation of ctx (bus shutdown), otherwise a receiver
 // that has just finished successfully would be executed again after the restart.
-func (b *Bus) ack(ctx context.Context, msg re.XMessage, kinds ...string) error {
+//
+// acked is false when the message had been acknowledged already by another run (see Stats.Duplicates).
+func (b *Bus) ack(ctx context.Context, msg re.XMessage, kinds ...string) (acked bool, err error) {
 	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), ackTimeout)
 	defer cancel()
 
-	var err error
 	if b.statsOn() {
-		err = b.runOutcome(ackCtx, msg, true, kinds)
+		acked, err = b.runOutcome(ackCtx, msg, true, kinds)
 	} else {
-		_, err = b.redis.XAck(ackCtx, b.stream, b.group, msg.ID)
+		var n int64
+		n, err = b.redis.XAck(ackCtx, b.stream, b.group, msg.ID)
+		acked = n == 1
 	}
 	if err != nil {
-		b.Errorf(ctx, "Failed to acknowledge message %q (stream %q, group %q), it stays pending and will be redelivered: %v", msg.ID, b.stream, b.group, err)
 		b.counters.ackErrors.Add(1)
-		return fmt.Errorf("acknowledge message %s: %w", msg.ID, err)
+		return false, fmt.Errorf("acknowledge message %s in group %q, it stays pending and will be redelivered: %w", msg.ID, b.group, err)
 	}
-	return nil
+	return acked, nil
 }
 
 // deliveryCount returns how many times Redis has delivered the pending entry id to the group
@@ -1056,82 +1305,4 @@ func (b *Bus) deliveryCount(ctx context.Context, id string) (deliveries int64, p
 		return 0, false, nil
 	}
 	return res[0].RetryCount, true, nil
-}
-
-// SetRetry sets the retry count for a specific message key in Redis.
-//
-// Deprecated: the bus no longer uses this counter. The number of attempts is taken from the delivery
-// counter Redis keeps for every pending stream entry. The method is kept for compatibility and only
-// touches the legacy key "<stream>:retry:<key>".
-// It constructs a Redis key using the stream name and the provided key,
-// and sets the retry count as the value.
-// If setting the retry count fails, it logs an error.
-// TTL for the retry count is set to three times the product of numRetries and retryIdleTime
-// to ensure it persists long enough for all retries.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - key: The unique key for the message whose retry count is to be set.
-//   - num: The retry count to set for the specified message key.
-func (b *Bus) SetRetry(ctx context.Context, key string, num int) {
-	// Set the retry count in Redis with a TTL in a seconds. Time multiplied by 3 to ensure that all retries have enough time to be attempted before the retry count expires.
-	err := b.redis.Set(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), strconv.Itoa(num), int(b.numRetries*b.retryIdleTime*3))
-	if err != nil {
-		b.Errorf(ctx, "Failed to set retry count for key %q: %v", key, err)
-	}
-}
-
-// GetRetry retrieves the retry count for a specific message key from Redis.
-//
-// Deprecated: the bus no longer uses this counter. The number of attempts is taken from the delivery
-// counter Redis keeps for every pending stream entry. The method is kept for compatibility and only
-// reads the legacy key "<stream>:retry:<key>". Note that it cannot tell a Redis error from an
-// exhausted limit: both are reported as retryFailed.
-// It constructs a Redis key using the stream name and the provided key,
-// and retrieves the retry count value.
-// If retrieving the retry count fails, it logs an error and returns retryFailed for end retrying.
-// If the retrieved value cannot be converted to an integer, it also returns retryFailed.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - key: The unique key for the message whose retry count is to be retrieved.
-//
-// Returns:
-//   - int: The retry count for the specified message key, or retryFailed if an error occurs.
-func (b *Bus) GetRetry(ctx context.Context, key string) int {
-	val, err := b.redis.Get(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key), "0")
-	if err != nil {
-		b.Errorf(ctx, "Failed to get retry count for key %q: %v", key, err)
-		return retryFailed
-	}
-
-	num, err := strconv.Atoi(val)
-	if err != nil {
-		return retryFailed
-	}
-
-	return num
-}
-
-// DelRetry deletes the retry count for a specific message key from Redis.
-//
-// Deprecated: the bus no longer uses this counter; see SetRetry. Kept for compatibility.
-// It constructs a Redis key using the stream name and the provided key,
-// and deletes the corresponding entry from Redis.
-// If deleting the retry count fails, it logs an error.
-//
-// Parameters:
-//   - ctx: The context for the operation.
-//   - key: The unique key for the message whose retry count is to be deleted.
-func (b *Bus) DelRetry(ctx context.Context, key string) {
-	err := b.redis.Del(ctx, fmt.Sprintf("%s:retry:%s", b.stream, key))
-	if err != nil {
-		b.Errorf(ctx, "Failed to delete retry count for key %q: %v", key, err)
-	}
-}
-
-func Caller() string {
-	pc, file, line, _ := runtime.Caller(1)
-	fn := runtime.FuncForPC(pc)
-	return fmt.Sprintf("%s:%d->%s", filepath.Base(file), line, strings.TrimPrefix(fn.Name(), "github.com/ra-company/bus/"))
 }

@@ -162,7 +162,9 @@ func redisLegacy(t *testing.T) {
 // TestAddMessage_EmptyReceiver verifies the early-return error path that does
 // not touch Redis, so no connection is needed.
 func TestAddMessage_EmptyReceiver(t *testing.T) {
-	_, err := (&Bus{}).AddMessage(t.Context(), "", struct{}{}, "")
+	b := &Bus{}
+	b.initialized.Store(true) // the title is checked before Redis is touched
+	_, err := b.AddMessage(t.Context(), "", struct{}{}, "")
 	require.ErrorIs(t, err, ErrorEmptyReceiverTitle)
 }
 
@@ -291,38 +293,6 @@ func redisBus_Init_Defaults(t *testing.T) {
 	}
 }
 
-// redisBus_RetryManagement tests the SetRetry / GetRetry / DelRetry round-trip
-// using a real Redis connection.
-func redisBus_RetryManagement(t *testing.T) {
-	redis, cfg := redisStart(t)
-	b := &Bus{}
-	b.Init(t.Context(), &BusConfiguration{
-		Redis:         *cfg,
-		Stream:        uuid.New().String(),
-		NumRetries:    5,
-		RetryIdleTime: 10,
-	})
-	defer redis.XGroupDestroy(context.Background(), b.stream, b.group)
-
-	ctx := t.Context()
-	key := uuid.New().String()
-
-	t.Run("unknown key returns 0", func(t *testing.T) {
-		require.Equal(t, 0, b.GetRetry(ctx, key))
-	})
-
-	t.Run("SetRetry then GetRetry returns same value", func(t *testing.T) {
-		b.SetRetry(ctx, key, 3)
-		require.Equal(t, 3, b.GetRetry(ctx, key))
-	})
-
-	t.Run("DelRetry removes the key so GetRetry returns 0", func(t *testing.T) {
-		b.SetRetry(ctx, key, 2)
-		b.DelRetry(ctx, key)
-		require.Equal(t, 0, b.GetRetry(ctx, key))
-	})
-}
-
 // redisProcessMessage_InvalidReceiverField verifies that a message whose
 // "receiver" field is not a string is ACKed and returns ErrorInvalidReceiverName.
 func redisProcessMessage_InvalidReceiverField(t *testing.T) {
@@ -389,13 +359,13 @@ func TestReceiver_PreloadVariables_MissingReceiverKey(t *testing.T) {
 }
 
 // TestReceiver_PreloadVariables_InvalidEventTime verifies that an unparseable
-// event time does not return an error but falls back to current time.
+// message time does not return an error but falls back to current time.
 func TestReceiver_PreloadVariables_InvalidEventTime(t *testing.T) {
 	before := time.Now().UTC()
 	r := &Receiver{}
 	_, err := r.PreloadVariables(t.Context(), map[string]any{
 		"receiver": "recv",
-		"event":    "not-a-time",
+		"time":     "not-a-time",
 	})
 	require.NoError(t, err)
 	require.False(t, r.event.Before(before), "fallback event should not be before test start")
@@ -461,12 +431,12 @@ func TestReceiver_PreloadVariables_EmptyPayload(t *testing.T) {
 	require.Nil(t, r.Payload, "Payload should remain nil when not provided")
 }
 
-// TestReceiver_InFlight verifies that InFlight reads from the injected counter.
-// The counter is managed by Bus.processMessage; Receiver only reads it.
+// TestReceiver_InFlight verifies that InFlight reads from the bound counter.
+// The counter is managed by the bus; Receiver only reads it.
 func TestReceiver_InFlight(t *testing.T) {
 	var counter atomic.Int64
 	r := &Receiver{}
-	r.SetBusContext(&counter, 5)
+	r.bindBus(nil, counter.Load, 5)
 
 	require.Equal(t, "[0/5]", r.InFlight())
 	counter.Add(1)
@@ -476,36 +446,23 @@ func TestReceiver_InFlight(t *testing.T) {
 }
 
 // TestReceiver_InFlight_NilCounter verifies the fallback format when
-// SetBusContext has not been called.
+// the receiver was never bound to a bus.
 func TestReceiver_InFlight_NilCounter(t *testing.T) {
 	r := &Receiver{}
 	require.Equal(t, "[?/0]", r.InFlight())
 }
 
-// testTitleImpl is a minimal TitleInterface implementation for testing.
-type testTitleImpl struct{ name string }
-
-func (ti *testTitleImpl) Title() string { return ti.name }
-
-// TestReceiver_title_WithSelf verifies that a non-nil Self returns its Title().
-func TestReceiver_title_WithSelf(t *testing.T) {
-	r := &Receiver{Self: &testTitleImpl{name: "MyReceiver"}}
-	require.Equal(t, "MyReceiver", r.title())
-}
-
-// TestReceiver_title_WithoutSelf verifies that a nil Self returns an empty string.
-func TestReceiver_title_WithoutSelf(t *testing.T) {
+// TestReceiver_title_Default verifies that an unbound Receiver has the default, empty title.
+func TestReceiver_title_Default(t *testing.T) {
 	r := &Receiver{}
+	require.Equal(t, "", r.Title())
 	require.Equal(t, "", r.title())
 }
 
-// TestCaller verifies that Caller returns a non-empty, formatted string
-// containing a filename, line number, and function name.
+// TestCaller verifies that caller returns "file:line->function" of its caller,
+// without the package path.
 func TestCaller(t *testing.T) {
-	s := Caller()
-	require.NotEmpty(t, s)
-	require.Contains(t, s, ":", "Caller should contain file:line separator")
-	require.Contains(t, s, "->", "Caller should contain -> function separator")
+	require.Regexp(t, `^bus_test\.go:\d+->TestCaller$`, caller())
 }
 
 // testParamsImpl is a minimal ParamsInterface implementation for testing.
@@ -515,12 +472,7 @@ func (p *testParamsImpl) Title() string        { return "ParamsReceiver" }
 func (p *testParamsImpl) DrawParams() []string { return []string{"key=val", "x=1"} }
 
 // TestReceiver_Start_LogsParams verifies that Start does not error when Payload
-// implements ParamsInterface.
-//
-// NOTE: the current check in Start is r.Payload.(ParamsInterface), not
-// r.Self.(ParamsInterface). Since r.Payload is auto-unmarshalled from JSON
-// (typically map[string]any), the check will never fire in practice. The
-// intended check is most likely r.Self.(ParamsInterface).
+// implements ParamsInterface (Payload is meant to hold a pointer to a typed struct).
 func TestReceiver_Start_LogsParams(t *testing.T) {
 	// Pre-set Payload to a ParamsInterface implementor; task has no "payload"
 	// key so PreloadVariables leaves r.Payload untouched.
@@ -557,7 +509,7 @@ func TestReceiver_PreloadVariables(t *testing.T) {
 		_, err := r.PreloadVariables(ctx, map[string]any{
 			"receiver": "my-receiver",
 			"payload":  `{"k":"v"}`,
-			"event":    now.Format(time.RFC3339Nano),
+			"time":     now.Format(time.RFC3339Nano),
 			"id":       id.String(),
 		})
 		require.NoError(t, err)
@@ -567,7 +519,7 @@ func TestReceiver_PreloadVariables(t *testing.T) {
 		require.True(t, now.Equal(r.event), "event time mismatch: %v vs %v", now, r.event)
 	})
 
-	t.Run("missing event defaults to current time", func(t *testing.T) {
+	t.Run("missing time defaults to current time", func(t *testing.T) {
 		before := time.Now().UTC()
 		r := &Receiver{}
 		_, err := r.PreloadVariables(ctx, map[string]any{"receiver": "receiver"})
@@ -598,11 +550,11 @@ func TestBus_ReceiversCount_NilMap(t *testing.T) {
 	require.Equal(t, 0, b.ReceiversCount())
 }
 
-// TestReceiver_Execute_Panics verifies that the base Receiver.Execute panics
-// (it is a placeholder that must be overridden by concrete receivers).
-func TestReceiver_Execute_Panics(t *testing.T) {
-	r := &Receiver{}
-	require.Panics(t, func() { _ = r.Execute(t.Context()) })
+// TestReceiver_HasNoExecute verifies that Receiver alone is not a receiver: a type that embeds it and forgets
+// Execute does not compile as a factory result instead of panicking on every message.
+func TestReceiver_HasNoExecute(t *testing.T) {
+	_, ok := any(&Receiver{}).(ReceiverInterface)
+	require.False(t, ok)
 }
 
 // redisProcessMessage_StartError verifies that processMessage propagates the
@@ -634,30 +586,4 @@ func redisProcessMessage_ExecuteError(t *testing.T) {
 	err := env.b.processMessage(t.Context(), env.deliver())
 	require.Error(t, err, "processMessage should surface the Execute error")
 	require.EqualValues(t, 1, env.pending(), "a failed message stays pending")
-}
-
-// redisBus_GetRetry_CorruptValue verifies that GetRetry returns retryFailed
-// when the Redis value cannot be parsed as an integer (simulated corruption).
-func redisBus_GetRetry_CorruptValue(t *testing.T) {
-	rdb, cfg := redisStart(t)
-
-	b := &Bus{}
-	b.Init(t.Context(), &BusConfiguration{
-		Redis:         *cfg,
-		Stream:        uuid.New().String(),
-		NumRetries:    5,
-		RetryIdleTime: 10,
-	})
-	defer rdb.XGroupDestroy(context.Background(), b.stream, b.group)
-
-	ctx := t.Context()
-	key := uuid.New().String()
-	redisKey := fmt.Sprintf("%s:retry:%s", b.stream, key)
-
-	err := rdb.Set(ctx, redisKey, "not-a-number", 60)
-	require.NoError(t, err)
-	defer rdb.Del(ctx, redisKey)
-
-	got := b.GetRetry(ctx, key)
-	require.Equal(t, retryFailed, got, "corrupt stored value should map to retryFailed")
 }

@@ -2,6 +2,7 @@ package bus
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -99,7 +100,7 @@ func redisHandlerTimeoutBoundsConcurrency(t *testing.T) {
 	require.EqualValues(t, 2, env.b.Stats().TimedOut)
 
 	released.do(func() { close(release) })
-	// The runs that were held are failures, even though the receivers returned nil; the messages are redone.
+	// The runs that were held succeeded late: they are acknowledged, the other messages are processed after them.
 	require.Eventually(t, func() bool { return env.b.Stats().Stuck == 0 && env.b.Stats().Processed == 5 }, 20*time.Second, 50*time.Millisecond)
 	require.LessOrEqual(t, peak.Load(), int32(2))
 }
@@ -120,7 +121,7 @@ func redisHandlerTimeoutExhaustsRetries(t *testing.T) {
 	require.EqualValues(t, 2, env.b.Stats().TimedOut)
 }
 
-// Without a limit a long receiver is left alone, as before.
+// Without a limit a long receiver is left alone.
 func redisHandlerTimeoutOff(t *testing.T) {
 	env := newTestEnv(t, func(c *BusConfiguration) { c.RetryIdleTime = 600; c.HandlerTimeout = -1 })
 	var runs atomic.Int32
@@ -169,3 +170,49 @@ func TestHandlerTimeout_ExhaustsRetries(t *testing.T) {
 }
 func TestHandlerTimeout_Off(t *testing.T)          { eachRedis(t, redisHandlerTimeoutOff) }
 func TestHandlerTimeout_FastReceiver(t *testing.T) { eachRedis(t, redisHandlerTimeoutFastReceiver) }
+
+// A receiver that ignores its context but succeeds after the limit has done its work: the message is
+// acknowledged and not executed again.
+func redisHandlerTimeoutLateSuccessIsAcknowledged(t *testing.T) {
+	env := newTestEnv(t, func(c *BusConfiguration) { c.RetryIdleTime = 600; c.HandlerTimeout = 100 * time.Millisecond })
+	var runs atomic.Int32
+	env.register("event", func(context.Context, *scriptReceiver) error {
+		runs.Add(1)
+		time.Sleep(300 * time.Millisecond) // past the limit, ignoring ctx
+		return nil
+	})
+	env.add("event")
+
+	env.readOnce()
+
+	st := env.b.Stats()
+	require.EqualValues(t, 1, runs.Load())
+	require.EqualValues(t, 1, st.TimedOut, "the run did exceed the limit")
+	require.EqualValues(t, 1, st.Processed, "a late success is a success")
+	require.Zero(t, st.Failed)
+	require.Zero(t, st.Stuck)
+	require.Zero(t, env.pendingCount(), "the message is acknowledged")
+	require.Empty(t, env.log.errorsMentioning("did not finish"), "a late success is not an error")
+}
+
+// A receiver that fails after the limit fails with ErrorHandlerTimeout and stays pending for a retry.
+func redisHandlerTimeoutLateFailureIsRetried(t *testing.T) {
+	env := newTestEnv(t, func(c *BusConfiguration) { c.RetryIdleTime = 600; c.HandlerTimeout = 100 * time.Millisecond })
+	env.register("event", func(context.Context, *scriptReceiver) error {
+		time.Sleep(300 * time.Millisecond)
+		return errors.New("late failure")
+	})
+	env.add("event")
+
+	err := env.b.processMessage(t.Context(), env.deliver())
+	require.ErrorIs(t, err, ErrorHandlerTimeout)
+	require.EqualValues(t, 1, env.b.Stats().Failed)
+	require.EqualValues(t, 1, env.pendingCount())
+}
+
+func TestHandlerTimeout_LateSuccessIsAcknowledged(t *testing.T) {
+	eachRedis(t, redisHandlerTimeoutLateSuccessIsAcknowledged)
+}
+func TestHandlerTimeout_LateFailureIsRetried(t *testing.T) {
+	eachRedis(t, redisHandlerTimeoutLateFailureIsRetried)
+}

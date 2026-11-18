@@ -19,12 +19,27 @@ building on it:
   the stream (`$`), so it sees only messages added after it was created. To make sure other services
   do not miss events published before they first started, the producer calls `EnsureGroups(ctx, "service-a", ...)`:
   it creates the missing groups (and the stream) at position `0`; existing groups are left untouched.
-* **Unregistered receivers are acknowledged and ignored.** A consumer group sees the whole stream, so events
-  this service does not handle are normal. If a message names a receiver that is not registered in this
-  process, it is acknowledged and dropped without a trace in the dead-letter stream (a warning is logged
-  only when `ShowUnregistered` is set). `Subscribe(ctx, title, factory)` is a synonym of `RegisterReceiver`
-  that states the intent: "this service handles this event". Register all receivers before `Start`; a message
-  that arrives while its receiver is missing is lost for this group.
+* **Unregistered receivers.** A consumer group sees the whole stream, so events this service does not handle
+  are normal. What happens to a message whose receiver is not registered in this process is set by
+  `BusConfiguration.Unregistered` (a warning is logged only when `ShowUnregistered` is set):
+  * `UnregisteredAck` (default) — acknowledged and dropped without a trace in the dead-letter stream.
+    Right when every instance of the group runs the same code.
+  * `UnregisteredLeave` — left pending and redelivered after `RetryIdleTime`, possibly to an instance that has
+    the receiver; after `NumRetries` deliveries it goes to the dead-letter stream (reason `unregistered`), that
+    is after about `NumRetries × RetryIdleTime` (5 minutes by default) if no instance has the receiver.
+    Use it for rolling deploys that add receivers: old instances then do not drop the new messages.
+  * `UnregisteredDeadLetter` — moved to the dead-letter stream at once (reason `unregistered`).
+
+  `Subscribe(ctx, title, factory)` is a synonym of `RegisterReceiver` that states the intent: "this service
+  handles this event". Register all receivers before `Start`.
+* **Receiver title.** A receiver that embeds `bus.Receiver` and has its own `Title() string` method is named
+  in the logs automatically. A type built on another receiver can redefine `Title` again: the outermost
+  definition is used, and without one the inherited title stays. The same holds for
+  `DrawParams() []string` (`ParamsInterface`) on the receiver or on its payload.
+  `bus.Receiver` has no `Execute` of its own: a type that forgets it does not compile as a factory result.
+  `Finish` runs after every started execution, also after a panic. The factory must return a new receiver
+  (with a new payload) on every call: receivers run concurrently. A `null` payload (`AddMessage` with `nil`)
+  leaves the payload pointer set by the factory untouched.
 * **Retries.** `NumRetries` (default 5) is the maximum number of executions of one message. The count is
   the delivery counter Redis keeps for every pending entry (`XPENDING`; `XREADGROUP` sets it to 1, every
   redelivery adds one), so it is atomic, needs no extra keys or TTL, works the same on a single node and in
@@ -33,8 +48,18 @@ building on it:
   group's value. If the counter cannot be read (Redis is briefly unavailable) the message is left pending and
   retried later instead of being discarded. A failed message is picked up again after it has been idle for
   `RetryIdleTime` seconds (default 60) without a sign of life from its worker (see Lease); this is a setting of the group only. A panic in a receiver is recovered
-  and counts as a failure. `SetRetry`, `GetRetry` and `DelRetry` operate on the legacy `<stream>:retry:<id>`
-  keys, are deprecated and no longer influence retries.
+  and counts as a failure.
+* **Lost group.** If Redis answers `NOGROUP` (the stream key was deleted or the group destroyed), the workers
+  pause, create the group again and carry on; `Init` does the same when it finds no group. Redis cannot tell
+  where the group was, so the bus marks a recreated stream: whoever creates the stream key through this library
+  (a producer's `AddMessage`, `Init`, `EnsureGroups`, a worker) sets the key `{<stream>}:reborn` in the same
+  atomic step, kept for `StreamRebirthTTL` (default 1 hour). A group created while the mark exists starts at the
+  beginning of the stream: everything in it is new, nothing is lost. Without the mark only the group was
+  destroyed: it starts at the end of the stream, so messages processed already do not run again.
+  Limits: a stream created by a writer outside this library has no mark, and a service that notices the loss
+  later than `StreamRebirthTTL` (for example it was down longer) starts at the end; set `StreamRebirthTTL` above
+  the longest downtime. A failed read pauses the worker for 5 seconds, so an unreachable Redis does not turn the
+  workers into a busy loop.
 * **Dead-letter.** A message that has been delivered more than its limit allows, or whose receiver returned
   `bus.Permanent(err)`, is copied to the dead-letter stream and then acknowledged. The stream is
   `<Stream>:dead` unless `DeadLetterStream` is set. An entry keeps `receiver`, `id`, `payload` and `time`
@@ -48,8 +73,10 @@ building on it:
 * **Permanent errors.** `bus.Permanent(err)` marks an error that retrying cannot fix (for example the payload
   is invalid): the message goes to the dead-letter stream at once, without retries. `bus.IsPermanent(err)` tells
   whether an error is marked; `errors.Is` / `errors.As` still see the wrapped error.
-* **Stream size.** Every `AddMessage` trims the stream exactly (`XADD MAXLEN`) to `StreamSize` entries
-  (default 10000), dropping the oldest ones, even if they have not been processed yet. Size the stream so
+* **Stream size.** Every `AddMessage` trims the stream (`XADD MAXLEN ~`) to about `StreamSize` entries
+  (default 10000), dropping the oldest ones, even if they have not been processed yet. The trimming is
+  approximate: Redis removes whole nodes, so the stream may hold up to about a hundred entries more, which keeps
+  every `AddMessage` cheap. Size the stream so
   that it holds more than the backlog you can have. This limit is hard: it is the only limit of the stream
   and it can remove an unprocessed message. There is no limit by age: how many days the stream holds follows
   from `StreamSize` and the publishing rate.
@@ -66,16 +93,24 @@ building on it:
 * **Receiver time limit.** `HandlerTimeout` is the longest time one receiver may run for one message (default
   `10 * RetryIdleTime`, `-1` switches the limit off). It is independent of `RetryIdleTime`. When the time is up the
   receiver's context is cancelled (its cause is `bus.ErrorHandlerTimeout`), `Stats().TimedOut` grows and the lease is
-  no longer renewed, so the message is redelivered `RetryIdleTime` later at the latest; when the receiver returns, the
-  run counts as a failure (`Stats().Failed`) even if it returns nil, and the message is retried like after any
-  failure, or goes to the dead-letter stream when its retries are exhausted. The receiver runs in the worker's own
+  no longer renewed, so the message is redelivered `RetryIdleTime` later at the latest. When the receiver returns an
+  error, the run counts as a failure (`Stats().Failed`) and the message is retried like after any failure, or goes
+  to the dead-letter stream when its retries are exhausted. When it returns nil late, the work is done: the message
+  is acknowledged and not executed again. The receiver runs in the worker's own
   goroutine: there are never more receivers running than `WorkersCount`, so a hanging receiver cannot pile up
   goroutines or connections. The price: Go cannot kill a goroutine, so a receiver that ignores its context keeps its
   worker until it returns on its own, and `Stats().Stuck` shows how many workers are held that way (when it equals
   the number of workers, nothing is processed: alert on it). Receivers should pass their `ctx` to every call that can
   block. With the limit off a receiver that hangs and ignores its context holds its worker and its message for ever.
-  What a run past its limit has already done (a database write, a request sent) stays done and the message is
-  executed again, so receivers must be idempotent, as with any retry.
+  What a run past its limit that then fails has already done (a database write, a request sent) stays done and the
+  message is executed again; a message redelivered while the late run was still going runs twice. So receivers must
+  be idempotent, as with any retry (`GetID()` is the key).
+* **Initialisation.** `Init(ctx, &bus.BusConfiguration{...})` connects to Redis and creates the bus' group; call
+  it once. Receivers may be registered before or after it. A second `Init` after a successful one (or while
+  another runs) returns `bus.ErrorAlreadyInitialized` and changes nothing; a failed `Init` (for example Redis is
+  unreachable) closes its connection and may be retried; `Init(ctx, nil)` returns `bus.ErrorNilConfiguration`.
+  Until `Init` has succeeded, `AddMessage`, `EnsureGroups`, `Counters` and `Snapshot` return
+  `bus.ErrorNotInitialized` and `Start` logs an error and returns at once; `Stop` and `Close` are safe in any state.
 * **Stopping.** `bus.Stop(ctx)` makes the workers stop reading new messages and waits until the messages being
   processed are finished and acknowledged; a worker that is blocked on an empty stream notices within a second.
   Messages that were not read stay in the stream for the next run. If `ctx` expires first, the context of the
@@ -84,8 +119,8 @@ building on it:
   so it stays pending and is redelivered after `RetryIdleTime` (or is acknowledged when the receiver finally
   succeeds). After such a timeout nothing new is executed: a read that was already blocked may still bring a message,
   it is left pending. `Stop` is safe to repeat and to call concurrently; `Start` returns when the bus has stopped, and
-  does nothing after `Stop`; the bus cannot be restarted. `bus.Close(ctx)` is `Stop` plus closing the Redis connection.
-  `Start` also reacts to its own context and to SIGINT/SIGTERM. By default this is a hard stop, as before:
+  does nothing after `Stop` or when the bus is already running; the bus cannot be restarted. `bus.Close(ctx)` is `Stop` plus closing the Redis connection.
+  `Start` also reacts to its own context and to SIGINT/SIGTERM. By default this is a hard stop:
   the context of the running receivers is cancelled at once and their messages stay pending. Set
   `ShutdownTimeout` (for example `30 * time.Second`) to make it graceful: running receivers then get that long to
   finish with an uncancelled context, after which they are cancelled and `Start` returns. Prefer this setting for
@@ -116,7 +151,11 @@ building on it:
   once). Keys with a TTL can be evicted early under `maxmemory-policy volatile-*` when memory is short. Stream names
   with unbalanced braces are rejected with `ErrorDedupStreamName`.
 * **Message format.** Fields `receiver`, `id` (UUID), `payload` (JSON) and `time` (RFC 3339 with nanoseconds,
-  UTC). `Receiver` exposes the time to the receiver; the legacy field `event` is read if `time` is absent.
+  UTC). A receiver that embeds `Receiver` reads them with `GetID()`, `GetTime()`, `GetName()` and `GetPayload()`;
+  `GetID()` is the same for every delivery of a message, use it to make the receiver idempotent.
+* **Memory policy.** Use `maxmemory-policy noeviction` (or a `volatile-*` policy) for the Redis that holds the bus.
+  Under `allkeys-*` Redis may evict the stream itself: that is the same as deleting it, and the messages that were
+  delivered but not acknowledged yet (the pending list lives in the stream key) are lost; no mark can bring them back.
 * **Redis.** A single node and a cluster (comma-separated `Hosts`) are supported and tested. Redis 7.0 or newer
   is required (`XPENDING ... IDLE`, `XADD ... MINID`, the group lag); older servers are not supported.
 
@@ -133,13 +172,14 @@ for a consumer group (empty = the bus' own group), as a total and per receiver:
 | --- | --- |
 | `Published` | messages added to the stream (by every producer; the same for every group) |
 | `Deduplicated` | publications skipped as duplicates (`AddMessage` with a dedup key) |
-| `Received` | deliveries to the group whose handling has finished, whatever the outcome |
+| `Received` | deliveries to the group whose handling has finished, whatever the outcome, except `Duplicates` |
 | `Processed` | the receiver succeeded and the message was acknowledged |
 | `Failed` | executions that failed to start, returned an error or panicked (a message that fails three times counts three) |
 | `Retried` | executions of a message that had been delivered before |
 | `DeadLettered` | messages moved to the dead-letter stream |
 | `Unregistered` | messages for receivers this service has not registered (acknowledged and ignored) |
 | `Invalid` | messages without a valid receiver name |
+| `Duplicates` | successful runs whose message had been acknowledged by another run already (a late success after `HandlerTimeout`, or an at-least-once duplicate); not counted in `Received` or `Processed` |
 
 `bus.Snapshot(ctx)` returns the state right now: `Size` of the stream against `SizeLimit` (the `StreamSize` of this
 bus: at the limit every new message pushes the oldest one out, processed or not), `DeadLetterSize`, and for **every**
@@ -156,7 +196,7 @@ How it works. Counters are hashes per day, `{<stream>}:stats:g:<group>:<YYYYMMDD
 still costs two round trips (`XREADGROUP` and the acknowledgement) and the counters are consistent with the stream;
 a failed execution costs one more call. The braces keep the keys in the stream's cluster slot. A problem with a counter
 (for example a key of a wrong type) never fails a publication or leaves a message unacknowledged. Counters expire after
-`StatsRetention` (default 30 days, a negative value switches them off and brings back plain `XADD` / `XACK`). Receivers
+`StatsRetention` (default 30 days, a negative value switches them off). Receivers
 that are not registered in the process get their own counters only for the first 500 names, the rest is counted as
 `(other)`. `Received` is counted when the handling of a delivery finishes, so a message that is being executed now, or
 whose worker has died, shows up when it finishes or is redelivered.

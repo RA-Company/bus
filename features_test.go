@@ -139,14 +139,18 @@ func redisDeadLetterRetention(t *testing.T) {
 	require.Equal(t, "perm", entries[len(entries)-1].Values["receiver"])
 }
 
+// DeadLetterSize bounds the dead-letter stream. The trimming is approximate (whole nodes of
+// stream-node-max-entries, 100 by default), so enough entries are written to fill several nodes.
 func redisDeadLetterSizeCap(t *testing.T) {
-	env := newTestEnv(t, func(c *BusConfiguration) { c.DeadLetterSize = 3 })
-	env.register("perm", func(context.Context, *scriptReceiver) error { return Permanent(errors.New("bad")) })
-	for range 6 {
-		env.add("perm")
-		_ = env.b.processMessage(t.Context(), env.deliver())
+	const size, written, node = 3, 350, 100
+	env := newTestEnv(t, func(c *BusConfiguration) { c.DeadLetterSize = size })
+	for i := range written {
+		msg := re.XMessage{ID: fmt.Sprintf("1-%d", i), Values: map[string]any{"receiver": "perm"}}
+		require.NoError(t, env.b.deadLetter(t.Context(), msg, DeadReasonPermanent, "bad", 1))
 	}
-	require.EqualValues(t, 3, env.deadLen(), "DeadLetterSize is an upper bound on the number of entries")
+	n := env.deadLen()
+	require.GreaterOrEqual(t, n, int64(size))
+	require.LessOrEqual(t, n, int64(size+node), "DeadLetterSize bounds the dead-letter stream, up to one node more")
 }
 
 func redisDeadLetterCustomStream(t *testing.T) {
@@ -265,8 +269,10 @@ func redisEnsureGroups(t *testing.T) {
 		require.Len(t, streams[0].Messages, 2, "group %s must see messages added before it existed", group)
 	}
 
-	// Init still creates its own group at the end of the stream ("$"): a service that starts
-	// after the messages were added does not see them.
+	// On a stream that was not recreated recently, Init still creates its own group at the end ("$"): a
+	// service that starts after the messages were added does not see them. (Within StreamRebirthTTL of the
+	// stream's creation it would start at "0", see rebirth.go; the mark is removed to model an old stream.)
+	require.NoError(t, env.rdb.Del(t.Context(), env.b.rebornKey()))
 	late := &Bus{}
 	require.NoError(t, late.Init(t.Context(), &BusConfiguration{Redis: redisConfig(t), Stream: env.b.stream, Group: "late-init"}))
 	own, err := env.rdb.XReadGroup(t.Context(), &re.XReadGroupArgs{

@@ -112,8 +112,6 @@ func TestAddMessage_Success(t *testing.T) { eachRedis(t, redisAddMessage_Success
 
 func TestBus_Init_Defaults(t *testing.T) { eachRedis(t, redisBus_Init_Defaults) }
 
-func TestBus_RetryManagement(t *testing.T) { eachRedis(t, redisBus_RetryManagement) }
-
 func TestProcessMessage_InvalidReceiverField(t *testing.T) {
 	eachRedis(t, redisProcessMessage_InvalidReceiverField)
 }
@@ -127,8 +125,6 @@ func TestProcessMessage_RetryExceeded(t *testing.T) { eachRedis(t, redisProcessM
 func TestProcessMessage_StartError(t *testing.T) { eachRedis(t, redisProcessMessage_StartError) }
 
 func TestProcessMessage_ExecuteError(t *testing.T) { eachRedis(t, redisProcessMessage_ExecuteError) }
-
-func TestBus_GetRetry_CorruptValue(t *testing.T) { eachRedis(t, redisBus_GetRetry_CorruptValue) }
 
 func TestDelivery_AckOnlyAfterSuccess(t *testing.T) { eachRedis(t, redisDelivery_AckOnlyAfterSuccess) }
 
@@ -148,10 +144,6 @@ func TestDelivery_PanicInExecute(t *testing.T) { eachRedis(t, redisDelivery_Pani
 
 func TestDefect_CounterReadFailureKeepsMessagePending(t *testing.T) {
 	eachRedis(t, redisDefect_CounterReadFailureKeepsMessagePending)
-}
-
-func TestDefect_RetryCountDoesNotDependOnAuxiliaryKeys(t *testing.T) {
-	eachRedis(t, redisDefect_RetryCountDoesNotDependOnAuxiliaryKeys)
 }
 
 func TestDefect_ReceiverGetsMessageTime(t *testing.T) {

@@ -3,11 +3,16 @@ package bus
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	re "github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
 )
@@ -432,3 +437,122 @@ func redisRedeliveryUnderConstantLoad(t *testing.T) {
 }
 
 func TestRedelivery_UnderConstantLoad(t *testing.T) { eachRedis(t, redisRedeliveryUnderConstantLoad) }
+
+// ---------------------------------------------------------------------------
+// Start runs only once
+// ---------------------------------------------------------------------------
+
+func redisSecondStartDoesNothing(t *testing.T) {
+	env := newTestEnv(t, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	first := env.runBus(ctx)
+	require.Eventually(t, func() bool {
+		env.b.lc.Lock()
+		defer env.b.lc.Unlock()
+		return env.b.started
+	}, 5*time.Second, 10*time.Millisecond)
+
+	second := make(chan struct{})
+	go func() {
+		defer close(second)
+		env.b.Start(ctx)
+	}()
+	waitClosed(t, second, 2*time.Second, "the second Start to return at once")
+
+	select {
+	case <-first:
+		t.Fatal("the second Start must not stop the first one")
+	default:
+	}
+	cancel()
+	waitClosed(t, first, 10*time.Second, "the bus to stop")
+}
+
+func TestStart_SecondStartDoesNothing(t *testing.T) { eachRedis(t, redisSecondStartDoesNothing) }
+
+// ---------------------------------------------------------------------------
+// A second SIGTERM during the graceful wait kills the process
+// ---------------------------------------------------------------------------
+
+const signalChildEnv = "BUS_SECOND_SIGNAL_CHILD"
+
+// The test starts itself as a child process: the child runs a bus with a long ShutdownTimeout and a receiver
+// that never returns, then sends itself SIGTERM twice. The first one starts the graceful stop; the second one
+// must terminate the process with the default action instead of being swallowed by the bus.
+func TestStart_SecondSignalKillsProcess(t *testing.T) {
+	if os.Getenv(signalChildEnv) != "" {
+		secondSignalChild()
+		return
+	}
+	mode := modeSingle
+	if _, ok := redisConfigFor(mode); !ok {
+		mode = modeCluster
+		if _, ok := redisConfigFor(mode); !ok {
+			t.Skip("Redis is not configured")
+		}
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStart_SecondSignalKillsProcess$", "-test.v")
+	cmd.Env = append(os.Environ(), signalChildEnv+"="+mode)
+	out := &strings.Builder{}
+	cmd.Stdout, cmd.Stderr = out, out
+	require.NoError(t, cmd.Start())
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(40 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("the child did not exit after the second signal:\n%s", out.String())
+	}
+
+	require.Contains(t, out.String(), "child: second signal sent", "the child must get to the second signal:\n%s", out.String())
+	status, ok := cmd.ProcessState.Sys().(syscall.WaitStatus)
+	require.True(t, ok)
+	require.True(t, status.Signaled(), "the child must be killed by the signal, got exit code %d:\n%s", cmd.ProcessState.ExitCode(), out.String())
+	require.Equal(t, syscall.SIGTERM, status.Signal())
+}
+
+func secondSignalChild() {
+	ctx := context.Background()
+	cfg, _ := redisConfigFor(os.Getenv(signalChildEnv))
+	b := &Bus{}
+	if err := b.Init(ctx, &BusConfiguration{
+		Redis:           cfg,
+		Stream:          "bus-test-" + uuid.NewString(),
+		WorkersCount:    1,
+		ShutdownTimeout: time.Minute,
+		HandlerTimeout:  -1,
+	}); err != nil {
+		println("child: init:", err.Error())
+		os.Exit(3)
+	}
+	defer func() { _ = b.redis.Del(context.Background(), b.stream) }()
+
+	block := make(chan struct{})
+	b.RegisterReceiver(ctx, "hang", func() ReceiverInterface {
+		return &scriptReceiver{run: func(context.Context, *scriptReceiver) error { <-block; return nil }}
+	})
+	if _, err := b.AddMessage(ctx, "hang", nil, ""); err != nil {
+		println("child: add:", err.Error())
+		os.Exit(3)
+	}
+
+	go b.Start(ctx)
+	for deadline := time.Now().Add(15 * time.Second); b.inFlight.Load() == 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			println("child: the receiver did not start")
+			os.Exit(3)
+		}
+	}
+
+	_ = syscall.Kill(os.Getpid(), syscall.SIGTERM) // graceful stop begins
+	time.Sleep(500 * time.Millisecond)
+	println("child: second signal sent")
+	_ = syscall.Kill(os.Getpid(), syscall.SIGTERM) // must kill the process
+	time.Sleep(20 * time.Second)
+	println("child: still alive")
+	os.Exit(0)
+}

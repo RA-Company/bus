@@ -14,6 +14,9 @@ const (
 	DeadReasonRetriesExhausted = "retries_exhausted"
 	// DeadReasonPermanent: the receiver returned an error marked with Permanent.
 	DeadReasonPermanent = "permanent"
+	// DeadReasonUnregistered: no instance that read the message had its receiver registered
+	// (BusConfiguration.Unregistered is UnregisteredLeave or UnregisteredDeadLetter).
+	DeadReasonUnregistered = "unregistered"
 )
 
 const (
@@ -24,7 +27,7 @@ const (
 // deadLetter copies the message to the dead-letter stream. The entry keeps every field of the
 // original message (receiver, id, payload, time) unchanged and adds:
 //
-//	dead_reason      DeadReasonRetriesExhausted or DeadReasonPermanent
+//	dead_reason      DeadReasonRetriesExhausted, DeadReasonPermanent or DeadReasonUnregistered
 //	dead_error       text of the error, when there is one
 //	dead_stream      stream the message came from
 //	dead_group       consumer group that gave up on it
@@ -33,7 +36,8 @@ const (
 //	dead_at          when it was moved (RFC 3339 with nanoseconds, UTC)
 //
 // Old entries are trimmed on every write: by age (DeadLetterRetention, XADD MINID ~) and by
-// count (DeadLetterSize, XTRIM MAXLEN). A failure of the trimming is only logged.
+// count (DeadLetterSize, XTRIM MAXLEN ~). Both are approximate: Redis removes whole nodes of the stream, so it
+// may hold up to about a hundred entries more than the limit, which keeps trimming cheap. A failure of the trimming is only logged.
 func (b *Bus) deadLetter(ctx context.Context, msg re.XMessage, reason, errText string, deliveries int64) error {
 	values := make(map[string]any, len(msg.Values)+7)
 	for k, v := range msg.Values {
@@ -58,12 +62,11 @@ func (b *Bus) deadLetter(ctx context.Context, msg re.XMessage, reason, errText s
 		MinID:  minID,
 		Approx: true,
 	}); err != nil {
-		b.Errorf(ctx, "Failed to move message %q to dead-letter stream %q, it stays pending: %v", msg.ID, b.deadStream, err)
-		return fmt.Errorf("dead-letter message %s: %w", msg.ID, err)
+		return fmt.Errorf("move message %s to dead-letter stream %q, it stays pending: %w", msg.ID, b.deadStream, err)
 	}
 
 	if b.deadSize > 0 {
-		if err := b.redis.Client().XTrimMaxLen(ctx, b.deadStream, b.deadSize).Err(); err != nil {
+		if err := b.redis.Client().XTrimMaxLenApprox(ctx, b.deadStream, b.deadSize, 0).Err(); err != nil {
 			b.Warnf(ctx, "Failed to trim dead-letter stream %q: %v", b.deadStream, err)
 		}
 	}
@@ -80,8 +83,15 @@ func (b *Bus) discard(ctx context.Context, msg re.XMessage, reason, errText stri
 	if err := b.deadLetter(ctx, msg, reason, errText, deliveries); err != nil {
 		return err
 	}
-	if err := b.ack(ctx, msg, append(kinds, kindDead)...); err != nil {
+	acked, err := b.ack(ctx, msg, append(kinds, kindDead)...)
+	if err != nil {
 		return err
+	}
+	if !acked {
+		// Another run had acknowledged it already, so it was dead-lettered (or processed) there: this entry in the
+		// dead-letter stream is a duplicate and is counted as one, like in the Redis counters.
+		b.counters.duplicates.Add(1)
+		return nil
 	}
 	b.counters.deadLettered.Add(1)
 	return nil
